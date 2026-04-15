@@ -1,20 +1,18 @@
 """
 skin_train.py
 =============
-SkinAnalyzer 듀얼 편광 학습 스크립트
-
-입력
-----
-  rgb_cross    : 교차 편광 → 갈색/적색 반점 (발색단)
-  rgb_parallel : 평행 편광 → 주름
-
-Illumination Augmentation
---------------------------
-  두 편광 이미지에 동일한 조명 파라미터 적용
-  (동일 기기에서 촬영 → 같은 조명 환경 시뮬레이션)
+SkinAnalyzer 듀얼 편광 + 부분 GT 학습 스크립트
 
 실행
 ----
+  # 패치 먼저 준비
+  python data_prep.py \
+      --input_path ./raw_data/images \
+      --gt_path    ./raw_data/gt \
+      --patch_dir  ./patches \
+      --patch_size 256 --stride 256
+
+  # 학습
   python skin_train.py
 """
 
@@ -25,7 +23,7 @@ from pathlib import Path
 
 from skin_net     import build_analyzer
 from skin_loss    import SkinAnalyzerLoss, get_loss_weights
-from skin_dataset import SkinDataset
+from skin_dataset import SkinDataset, skin_collate_fn
 from ambient_aug  import apply_batch_illumination_aug
 
 
@@ -63,7 +61,7 @@ CFG = dict(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 학습 / 검증
+# 학습
 # ══════════════════════════════════════════════════════════════════════════════
 def train_one_epoch(model, loader, criterion, optimizer, device, cfg):
     model.train()
@@ -85,23 +83,30 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg):
         wrinkle_gt   = batch['wrinkle'].to(device)
         mask         = batch['mask'].to(device)
 
+        has_brown   = batch['has_brown']    # list[bool]
+        has_red     = batch['has_red']
+        has_wrinkle = batch['has_wrinkle']
+
         result = model(rgb_cross, rgb_parallel, mask)
 
-        # Consistency: 동일 조명 파라미터로 두 편광 모두 aug
+        # Consistency augmentation
         result_aug = None
         if criterion.w_consist > 0:
-            # 동일 seed로 두 이미지에 같은 조명 변형 적용
             rgb_cross_aug    = apply_batch_illumination_aug(rgb_cross,    **aug_kwargs)
             rgb_parallel_aug = apply_batch_illumination_aug(rgb_parallel, **aug_kwargs)
             with torch.no_grad():
                 result_aug = model(rgb_cross_aug, rgb_parallel_aug, mask)
 
         loss, detail = criterion(
-            result, brown_gt, red_gt, wrinkle_gt,
-            rgb_cross  = rgb_cross,
-            face_mask  = mask,
-            result_aug = result_aug,
-            model      = model if criterion.w_freq_reg > 0 else None,
+            result,
+            brown_gt, red_gt, wrinkle_gt,
+            rgb_cross   = rgb_cross,
+            face_mask   = mask,
+            has_brown   = has_brown,
+            has_red     = has_red,
+            has_wrinkle = has_wrinkle,
+            result_aug  = result_aug,
+            model       = model if criterion.w_freq_reg > 0 else None,
         )
 
         optimizer.zero_grad()
@@ -117,6 +122,9 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg):
     return {'total': total_loss / n, **{k: v / n for k, v in log.items()}}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 검증
+# ══════════════════════════════════════════════════════════════════════════════
 @torch.no_grad()
 def validate(model, loader, criterion, device):
     model.eval()
@@ -133,9 +141,13 @@ def validate(model, loader, criterion, device):
 
         result = model(rgb_cross, rgb_parallel, mask)
         loss, detail = criterion(
-            result, brown_gt, red_gt, wrinkle_gt,
-            rgb_cross = rgb_cross,
-            face_mask = mask,
+            result,
+            brown_gt, red_gt, wrinkle_gt,
+            rgb_cross   = rgb_cross,
+            face_mask   = mask,
+            has_brown   = batch['has_brown'],
+            has_red     = batch['has_red'],
+            has_wrinkle = batch['has_wrinkle'],
         )
 
         total_loss += loss.item()
@@ -160,19 +172,24 @@ def main():
         low_r   = CFG['low_r'],
         high_r  = CFG['high_r'],
     ).to(device)
+    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {total_params:,}")
-
+    # Dataset + DataLoader (skin_collate_fn 사용)
     full_ds  = SkinDataset(CFG['patch_dir'], CFG['img_size'], augment=True)
     val_size = max(1, int(len(full_ds) * CFG['val_ratio']))
     train_ds, val_ds = random_split(full_ds, [len(full_ds) - val_size, val_size])
     val_ds.dataset.augment = False
 
-    train_loader = DataLoader(train_ds, CFG['batch_size'],
-                              shuffle=True,  num_workers=CFG['num_workers'], pin_memory=True)
-    val_loader   = DataLoader(val_ds,   CFG['batch_size'],
-                              shuffle=False, num_workers=CFG['num_workers'], pin_memory=True)
+    train_loader = DataLoader(
+        train_ds, CFG['batch_size'], shuffle=True,
+        num_workers=CFG['num_workers'], pin_memory=True,
+        collate_fn=skin_collate_fn,
+    )
+    val_loader = DataLoader(
+        val_ds, CFG['batch_size'], shuffle=False,
+        num_workers=CFG['num_workers'], pin_memory=True,
+        collate_fn=skin_collate_fn,
+    )
     print(f"Train: {len(train_ds)} / Val: {len(val_ds)}")
 
     criterion = SkinAnalyzerLoss(
@@ -192,7 +209,6 @@ def main():
     best_val = float('inf')
 
     for epoch in range(1, CFG['epochs'] + 1):
-
         weights = get_loss_weights(epoch, CFG['epochs'])
         for k, v in weights.items():
             setattr(criterion, k, v)
@@ -201,7 +217,6 @@ def main():
         val_log   = validate(model, val_loader, criterion, device)
         scheduler.step()
 
-        # 교차 편광 인코더의 저주파 억제 모니터링
         enc = model.cross_encoder
         low_gates = [
             torch.sigmoid(enc.freq1.low_logit).mean().item(),
@@ -223,13 +238,12 @@ def main():
 
         if val_log['total'] < best_val:
             best_val  = val_log['total']
-            ckpt_path = Path(CFG['checkpoint_dir']) / 'best_skin_analyzer.pth'
             torch.save({
                 'epoch'     : epoch,
                 'state_dict': model.state_dict(),
                 'val_loss'  : val_log,
                 'cfg'       : CFG,
-            }, ckpt_path)
+            }, Path(CFG['checkpoint_dir']) / 'best_skin_analyzer.pth')
             print(f"  Best 저장: val={best_val:.4f}")
 
     print("\n학습 완료!")

@@ -1,21 +1,39 @@
 """
 skin_dataset.py
 ===============
-SkinDataset : 듀얼 편광 피부 분석 데이터셋
+SkinDataset : 부분 GT(Partial Label) 지원 데이터셋
 
-디렉토리 구조
--------------
+manifest.json을 읽어 패치별로 어떤 GT가 있는지 파악.
+GT가 없는 task는 None 반환 → skin_loss.py에서 해당 loss 스킵.
+
+디렉토리 구조 (data_prep.py 출력)
+-----------------------------------
 patch_dir/
-  ├── rgb_cross/    *.png   교차 편광 RGB (발색단용)
-  ├── rgb_parallel/ *.png   평행 편광 RGB (주름용)
-  ├── brown/        *.png   melanin GT       (grayscale)
-  ├── red/          *.png   hemoglobin GT    (grayscale)
-  ├── wrinkle/      *.png   wrinkle GT       (grayscale)
-  └── mask/         *.png   피부 영역 마스크  (optional)
+  rgb_cross/      {stem}.png   교차 편광
+  rgb_parallel/   {stem}.png   평행 편광
+  brown/          {stem}.png   (있는 경우만)
+  red/            {stem}.png   (있는 경우만)
+  wrinkle/        {stem}.png   (있는 경우만)
+  mask/           {stem}.png   피부 영역 (없으면 전체)
+  manifest.json                패치별 GT 가용성
 
-주의: rgb_cross 와 rgb_parallel은 동일한 stem 이름으로 쌍을 이뤄야 함.
+__getitem__ 반환
+----------------
+{
+  'rgb_cross'    : [3,H,W],
+  'rgb_parallel' : [3,H,W],
+  'brown'        : [1,H,W] or None,
+  'red'          : [1,H,W] or None,
+  'wrinkle'      : [1,H,W] or None,
+  'mask'         : [1,H,W],
+  'has_brown'    : bool,
+  'has_red'      : bool,
+  'has_wrinkle'  : bool,
+  'stem'         : str,
+}
 """
 
+import json
 import random
 from pathlib import Path
 
@@ -35,12 +53,23 @@ class SkinDataset(Dataset):
         self.img_size  = img_size
         self.augment   = augment
 
-        # 교차 편광 이미지 목록을 기준으로 인덱싱
-        self.stems = sorted(
-            p.stem for p in (self.patch_dir / 'rgb_cross').glob('*.png')
-        )
-        assert len(self.stems) > 0, \
-            f"이미지를 찾을 수 없습니다: {patch_dir}/rgb_cross"
+        # manifest 로드
+        manifest_path = self.patch_dir / 'manifest.json'
+        if manifest_path.exists():
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                self.manifest = json.load(f)
+            self.stems = list(self.manifest.keys())
+        else:
+            # manifest 없으면 rgb_cross 기준으로 자동 탐색 (GT 없음으로 간주)
+            self.stems = sorted(
+                p.stem for p in (self.patch_dir / 'rgb_cross').glob('*.png')
+            )
+            self.manifest = {
+                stem: {'has_brown': False, 'has_red': False, 'has_wrinkle': False}
+                for stem in self.stems
+            }
+
+        assert len(self.stems) > 0, f"패치를 찾을 수 없습니다: {patch_dir}"
 
     def __len__(self):
         return len(self.stems)
@@ -56,29 +85,49 @@ class SkinDataset(Dataset):
         return TF.to_tensor(img)   # [1, H, W]  0~1
 
     def _apply_augment(self, *tensors):
-        """동일한 geometric augment를 모든 텐서에 적용"""
-        if random.random() > 0.5:
-            tensors = tuple(TF.hflip(t) for t in tensors)
-        if random.random() > 0.5:
-            tensors = tuple(TF.vflip(t) for t in tensors)
-        return tensors
+        """동일한 geometric augment를 모든 텐서에 적용 (None 안전)"""
+        do_hflip = random.random() > 0.5
+        do_vflip = random.random() > 0.5
+        result = []
+        for t in tensors:
+            if t is None:
+                result.append(None)
+                continue
+            if do_hflip:
+                t = TF.hflip(t)
+            if do_vflip:
+                t = TF.vflip(t)
+            result.append(t)
+        return tuple(result)
 
     def __getitem__(self, idx: int) -> dict:
         stem = self.stems[idx]
+        info = self.manifest[stem]
 
+        # 필수 입력 (항상 존재)
         rgb_cross    = self._load_rgb(self.patch_dir / 'rgb_cross'    / f'{stem}.png')
         rgb_parallel = self._load_rgb(self.patch_dir / 'rgb_parallel' / f'{stem}.png')
-        brown        = self._load_gray(self.patch_dir / 'brown'       / f'{stem}.png')
-        red          = self._load_gray(self.patch_dir / 'red'         / f'{stem}.png')
-        wrinkle      = self._load_gray(self.patch_dir / 'wrinkle'     / f'{stem}.png')
 
+        # 마스크 (없으면 전체 영역)
         mask_path = self.patch_dir / 'mask' / f'{stem}.png'
         mask = self._load_gray(mask_path) if mask_path.exists() \
                else torch.ones(1, self.img_size, self.img_size)
 
+        # GT (부분 로드)
+        def load_gt(task: str) -> torch.Tensor | None:
+            if not info.get(f'has_{task}', False):
+                return None
+            gt_path = self.patch_dir / task / f'{stem}.png'
+            return self._load_gray(gt_path) if gt_path.exists() else None
+
+        brown   = load_gt('brown')
+        red     = load_gt('red')
+        wrinkle = load_gt('wrinkle')
+
+        # Augmentation (GT가 None인 경우 그대로 통과)
         if self.augment:
-            rgb_cross, rgb_parallel, brown, red, wrinkle, mask = self._apply_augment(
-                rgb_cross, rgb_parallel, brown, red, wrinkle, mask)
+            rgb_cross, rgb_parallel, mask, brown, red, wrinkle = self._apply_augment(
+                rgb_cross, rgb_parallel, mask, brown, red, wrinkle)
 
         return {
             'rgb_cross'   : rgb_cross,
@@ -87,5 +136,43 @@ class SkinDataset(Dataset):
             'red'         : red,
             'wrinkle'     : wrinkle,
             'mask'        : mask,
+            'has_brown'   : brown   is not None,
+            'has_red'     : red     is not None,
+            'has_wrinkle' : wrinkle is not None,
             'stem'        : stem,
         }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Collate : None GT 처리 (DataLoader용)
+# ══════════════════════════════════════════════════════════════════════════════
+def skin_collate_fn(batch: list) -> dict:
+    """
+    None GT가 섞인 배치를 처리하는 커스텀 collate.
+    GT가 하나도 없는 task는 None을 반환, 있는 경우만 stack.
+    """
+    out = {}
+
+    # 항상 존재하는 필드
+    for key in ['rgb_cross', 'rgb_parallel', 'mask']:
+        out[key] = torch.stack([b[key] for b in batch])
+
+    # bool 필드
+    for key in ['has_brown', 'has_red', 'has_wrinkle']:
+        out[key] = [b[key] for b in batch]   # list[bool]
+
+    # GT: None이 섞여 있을 수 있음 → None은 zeros_like로 대체, has_* 로 마스킹
+    for task in ['brown', 'red', 'wrinkle']:
+        has_key = f'has_{task}'
+        tensors = []
+        flags   = []
+        for b in batch:
+            t = b[task]
+            flags.append(t is not None)
+            tensors.append(t if t is not None else
+                           torch.zeros(1, b['mask'].shape[1], b['mask'].shape[2]))
+        out[task]   = torch.stack(tensors)          # [B,1,H,W]
+        out[has_key] = flags                         # list[bool]
+
+    out['stem'] = [b['stem'] for b in batch]
+    return out

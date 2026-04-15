@@ -1,14 +1,16 @@
 """
 skin_loss.py
 ============
-SkinAnalyzerLoss : 듀얼 편광 입력 학습 Loss
+SkinAnalyzerLoss : 부분 GT(Partial Label) 지원 Loss
 
-Beer-Lambert recon은 교차 편광(rgb_cross)만 사용
-  → 교차 편광이 발색단 흡수 물리 모델에 적합
+GT가 없는 샘플은 해당 task loss를 0으로 처리.
+배치 내 일부 샘플만 GT가 있어도 올바르게 평균 계산.
+
+Beer-Lambert recon은 교차 편광(rgb_cross)만 사용.
 
 학습 단계
 ---------
-Phase 1 (0~40%) : supervised L1 + Beer-Lambert recon (교차 편광)
+Phase 1 (0~40%) : supervised L1 + Beer-Lambert recon
 Phase 2 (40~80%): + illumination consistency
 Phase 3 (80~100%): + freq gate regularization
 """
@@ -24,19 +26,9 @@ from skin_net import SkinResult
 # SkinAnalyzerLoss
 # ══════════════════════════════════════════════════════════════════════════════
 class SkinAnalyzerLoss(nn.Module):
-    """
-    Parameters
-    ----------
-    w_brown    : 갈색 반점 supervised loss 가중치
-    w_red      : 적색 반점 supervised loss 가중치
-    w_wrinkle  : 주름 supervised loss 가중치
-    w_recon    : Beer-Lambert 재구성 loss 가중치 (교차 편광 기준)
-    w_consist  : 조명 일관성 loss 가중치
-    w_freq_reg : 주파수 게이트 정규화 가중치
-    """
 
-    _MEL_ABS = [0.28, 0.18, 0.09]   # 멜라닌 채널별 흡수 계수 (R,G,B)
-    _HEM_ABS = [0.10, 0.35, 0.05]   # 헤모글로빈 채널별 흡수 계수
+    _MEL_ABS = [0.28, 0.18, 0.09]
+    _HEM_ABS = [0.10, 0.35, 0.05]
 
     def __init__(self,
                  w_brown:    float = 1.0,
@@ -58,19 +50,56 @@ class SkinAnalyzerLoss(nn.Module):
         self.register_buffer('hem_abs',
                              torch.tensor(self._HEM_ABS).view(1, 3, 1, 1))
 
-    def _masked_l1(self, pred, gt, mask):
-        denom = mask.sum().clamp(min=1.0)
-        return (F.l1_loss(pred, gt, reduction='none') * mask).sum() / denom
+    # ── 부분 GT L1 ──────────────────────────────────────────────────────────
+    def _partial_l1(self,
+                    pred:     torch.Tensor,
+                    gt:       torch.Tensor,
+                    face_mask:torch.Tensor,
+                    has_gt:   list[bool]) -> torch.Tensor:
+        """
+        배치 내 GT가 있는 샘플만 loss 계산.
 
-    def _beer_lambert_recon(self, brown_mask, red_mask, rgb_cross, mask):
-        """교차 편광 RGB를 발색단으로 재구성 후 L1 비교"""
+        pred      : [B,1,H,W]
+        gt        : [B,1,H,W]  (GT 없는 샘플은 zeros)
+        face_mask : [B,1,H,W]
+        has_gt    : list[bool]  길이 B
+        """
+        # GT 가용 마스크 [B,1,1,1]
+        gt_avail = torch.tensor(has_gt, dtype=torch.float32,
+                                device=pred.device).view(-1, 1, 1, 1)
+
+        # 픽셀 단위 L1 × face_mask × GT 가용 여부
+        per_pixel = F.l1_loss(pred, gt, reduction='none') * face_mask * gt_avail
+        denom = (face_mask * gt_avail).sum().clamp(min=1.0)
+        return per_pixel.sum() / denom
+
+    # ── Beer-Lambert recon ──────────────────────────────────────────────────
+    def _beer_lambert_recon(self,
+                            brown_mask: torch.Tensor,
+                            red_mask:   torch.Tensor,
+                            rgb_cross:  torch.Tensor,
+                            face_mask:  torch.Tensor,
+                            has_brown:  list[bool],
+                            has_red:    list[bool]) -> torch.Tensor:
+        """
+        brown 또는 red GT가 있는 샘플만 recon loss 계산.
+        """
+        has_any = [b or r for b, r in zip(has_brown, has_red)]
+        if not any(has_any):
+            return torch.tensor(0.0, device=rgb_cross.device)
+
         od_recon  = brown_mask * self.mel_abs + red_mask * self.hem_abs
         rgb_recon = torch.exp(-od_recon).clamp(0.0, 1.0)
-        return self._masked_l1(rgb_recon, rgb_cross, mask)
 
+        avail = torch.tensor(has_any, dtype=torch.float32,
+                             device=rgb_cross.device).view(-1, 1, 1, 1)
+        per_pixel = F.l1_loss(rgb_recon, rgb_cross, reduction='none') * face_mask * avail
+        denom = (face_mask * avail).sum().clamp(min=1.0)
+        return per_pixel.sum() / denom
+
+    # ── 주파수 게이트 정규화 ─────────────────────────────────────────────────
     @staticmethod
     def _freq_reg(model: nn.Module) -> torch.Tensor:
-        """교차 편광 인코더의 FrequencyGate low_logit을 0으로 억제"""
         enc = model.cross_encoder
         gates = [
             torch.sigmoid(enc.freq1.low_logit).mean(),
@@ -79,57 +108,63 @@ class SkinAnalyzerLoss(nn.Module):
         ]
         return sum(gates) / len(gates)
 
+    # ── forward ─────────────────────────────────────────────────────────────
     def forward(self,
-                result:       SkinResult,
-                brown_gt:     torch.Tensor,
-                red_gt:       torch.Tensor,
-                wrinkle_gt:   torch.Tensor,
-                rgb_cross:    torch.Tensor,   # Beer-Lambert recon용 교차 편광
-                face_mask:    torch.Tensor,
-                result_aug:   SkinResult | None = None,
-                model:        nn.Module  | None = None):
+                result:      SkinResult,
+                brown_gt:    torch.Tensor,
+                red_gt:      torch.Tensor,
+                wrinkle_gt:  torch.Tensor,
+                rgb_cross:   torch.Tensor,
+                face_mask:   torch.Tensor,
+                has_brown:   list[bool],
+                has_red:     list[bool],
+                has_wrinkle: list[bool],
+                result_aug:  SkinResult | None = None,
+                model:       nn.Module  | None = None):
         """
         Parameters
         ----------
-        result      : SkinResult (model forward 출력)
-        brown_gt    : [B,1,H,W]
-        red_gt      : [B,1,H,W]
-        wrinkle_gt  : [B,1,H,W]
-        rgb_cross   : [B,3,H,W]  교차 편광 원본 (recon loss용)
-        face_mask   : [B,1,H,W]
-        result_aug  : SkinResult (조명 aug 후, consistency 비활성 시 None)
-        model       : SkinAnalyzer (freq_reg 비활성 시 None)
-
-        Returns
-        -------
-        total_loss : scalar tensor
-        detail     : dict
+        has_brown / has_red / has_wrinkle : list[bool], 길이=B
+            배치 내 샘플별 GT 가용 여부 (data_prep.py manifest 기반)
         """
         detail = {}
 
-        # ── Supervised L1 ────────────────────────────────────────────────────
-        l_brown   = self._masked_l1(result.brown_mask,   brown_gt,   face_mask)
-        l_red     = self._masked_l1(result.red_mask,     red_gt,     face_mask)
-        l_wrinkle = self._masked_l1(result.wrinkle_mask, wrinkle_gt, face_mask)
+        # ── Supervised L1 (부분) ─────────────────────────────────────────────
+        l_brown = self._partial_l1(
+            result.brown_mask,   brown_gt,   face_mask, has_brown)
+        l_red = self._partial_l1(
+            result.red_mask,     red_gt,     face_mask, has_red)
+        l_wrinkle = self._partial_l1(
+            result.wrinkle_mask, wrinkle_gt, face_mask, has_wrinkle)
 
         detail.update(brown=l_brown.item(), red=l_red.item(), wrinkle=l_wrinkle.item())
 
-        loss = (self.w_brown   * l_brown +
-                self.w_red     * l_red   +
-                self.w_wrinkle * l_wrinkle)
+        # 유효한 task만 loss에 합산 (모두 0인 경우 방지)
+        n_active = sum([any(has_brown), any(has_red), any(has_wrinkle)])
+        loss = torch.tensor(0.0, device=rgb_cross.device)
+        if any(has_brown):
+            loss = loss + self.w_brown   * l_brown
+        if any(has_red):
+            loss = loss + self.w_red     * l_red
+        if any(has_wrinkle):
+            loss = loss + self.w_wrinkle * l_wrinkle
 
-        # ── Beer-Lambert recon (교차 편광) ───────────────────────────────────
+        # ── Beer-Lambert recon ───────────────────────────────────────────────
         l_recon = self._beer_lambert_recon(
-            result.brown_mask, result.red_mask, rgb_cross, face_mask)
+            result.brown_mask, result.red_mask, rgb_cross, face_mask,
+            has_brown, has_red)
         detail['recon'] = l_recon.item()
         loss = loss + self.w_recon * l_recon
 
         # ── Consistency ──────────────────────────────────────────────────────
         if self.w_consist > 0 and result_aug is not None:
             l_consist = (
-                self._masked_l1(result_aug.brown_mask,   result.brown_mask.detach(),   face_mask) +
-                self._masked_l1(result_aug.red_mask,     result.red_mask.detach(),     face_mask) +
-                self._masked_l1(result_aug.wrinkle_mask, result.wrinkle_mask.detach(), face_mask)
+                self._partial_l1(result_aug.brown_mask,
+                                 result.brown_mask.detach(), face_mask, has_brown) +
+                self._partial_l1(result_aug.red_mask,
+                                 result.red_mask.detach(),   face_mask, has_red)   +
+                self._partial_l1(result_aug.wrinkle_mask,
+                                 result.wrinkle_mask.detach(),face_mask, has_wrinkle)
             ) / 3.0
             detail['consist'] = l_consist.item()
             loss = loss + self.w_consist * l_consist
@@ -154,7 +189,6 @@ def get_loss_weights(epoch: int, total_epochs: int) -> dict:
     progress = epoch / total_epochs
     base = dict(w_brown=1.0, w_red=1.0, w_wrinkle=1.0,
                 w_recon=0.3, w_consist=0.0, w_freq_reg=0.0)
-
     if progress < 0.4:
         return base
     if progress < 0.8:
