@@ -60,12 +60,17 @@ class SkinDataset(Dataset):
                 self.manifest = json.load(f)
             self.stems = list(self.manifest.keys())
         else:
-            # manifest 없으면 rgb_cross 기준으로 자동 탐색 (GT 없음으로 간주)
+            # manifest 없으면 rgb_cross 기준으로 자동 탐색
+            # GT 가용성은 실제 파일 존재 여부로 판단 (all-False 방지)
             self.stems = sorted(
                 p.stem for p in (self.patch_dir / 'rgb_cross').glob('*.png')
             )
             self.manifest = {
-                stem: {'has_brown': False, 'has_red': False, 'has_wrinkle': False}
+                stem: {
+                    'has_brown'  : (self.patch_dir / 'brown'   / f'{stem}.png').exists(),
+                    'has_red'    : (self.patch_dir / 'red'     / f'{stem}.png').exists(),
+                    'has_wrinkle': (self.patch_dir / 'wrinkle' / f'{stem}.png').exists(),
+                }
                 for stem in self.stems
             }
 
