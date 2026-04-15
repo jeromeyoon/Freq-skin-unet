@@ -23,6 +23,7 @@ from pathlib import Path
 
 import torchvision.utils as vutils
 import torchvision.transforms.functional as TF
+from tqdm import tqdm
 
 from skin_net     import build_analyzer
 from skin_loss    import SkinAnalyzerLoss, get_loss_weights
@@ -126,7 +127,7 @@ def save_preview(model, preview_loader, device, epoch, save_dir: Path, n_images:
 # ══════════════════════════════════════════════════════════════════════════════
 # 학습
 # ══════════════════════════════════════════════════════════════════════════════
-def train_one_epoch(model, loader, criterion, optimizer, device, cfg):
+def train_one_epoch(model, loader, criterion, optimizer, device, cfg, epoch, total_epochs):
     model.train()
     total_loss = 0.0
     log = {k: 0.0 for k in ['brown', 'red', 'wrinkle', 'recon', 'consist', 'freq_reg']}
@@ -138,7 +139,12 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg):
         vignette_prob    = cfg['vignette_prob'],
     )
 
-    for batch in loader:
+    pbar = tqdm(loader,
+                desc=f"Train {epoch:03d}/{total_epochs}",
+                unit='batch', leave=False,
+                dynamic_ncols=True)
+
+    for step, batch in enumerate(pbar, 1):
         rgb_cross    = batch['rgb_cross'].to(device)
         rgb_parallel = batch['rgb_parallel'].to(device)
         brown_gt     = batch['brown'].to(device)
@@ -146,7 +152,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg):
         wrinkle_gt   = batch['wrinkle'].to(device)
         mask         = batch['mask'].to(device)
 
-        has_brown   = batch['has_brown']    # list[bool]
+        has_brown   = batch['has_brown']
         has_red     = batch['has_red']
         has_wrinkle = batch['has_wrinkle']
 
@@ -181,6 +187,14 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg):
         for k in log:
             log[k] += detail.get(k, 0.0)
 
+        # 배치 bar에 현재 평균 loss 표시
+        pbar.set_postfix(
+            loss=f"{total_loss / step:.4f}",
+            brown=f"{log['brown'] / step:.4f}",
+            red=f"{log['red'] / step:.4f}",
+        )
+
+    pbar.close()
     n = len(loader)
     return {'total': total_loss / n, **{k: v / n for k, v in log.items()}}
 
@@ -194,7 +208,9 @@ def validate(model, loader, criterion, device):
     total_loss = 0.0
     log = {k: 0.0 for k in ['brown', 'red', 'wrinkle', 'recon']}
 
-    for batch in loader:
+    pbar = tqdm(loader, desc="  Val  ", unit='batch', leave=False, dynamic_ncols=True)
+
+    for step, batch in enumerate(pbar, 1):
         rgb_cross    = batch['rgb_cross'].to(device)
         rgb_parallel = batch['rgb_parallel'].to(device)
         brown_gt     = batch['brown'].to(device)
@@ -217,6 +233,9 @@ def validate(model, loader, criterion, device):
         for k in log:
             log[k] += detail.get(k, 0.0)
 
+        pbar.set_postfix(loss=f"{total_loss / step:.4f}")
+
+    pbar.close()
     n = len(loader)
     return {'total': total_loss / n, **{k: v / n for k, v in log.items()}}
 
@@ -288,13 +307,20 @@ def main():
     print("\n학습 시작...")
     best_val = float('inf')
 
-    for epoch in range(1, CFG['epochs'] + 1):
+    # 전체 에폭 progress bar
+    epoch_bar = tqdm(range(1, CFG['epochs'] + 1),
+                     desc='Epochs', unit='ep', dynamic_ncols=True)
+
+    for epoch in epoch_bar:
         weights = get_loss_weights(epoch, CFG['epochs'])
         for k, v in weights.items():
             setattr(criterion, k, v)
 
-        train_log = train_one_epoch(model, train_loader, criterion, optimizer, device, CFG)
-        val_log   = validate(model, val_loader, criterion, device)
+        train_log = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, CFG,
+            epoch, CFG['epochs'],
+        )
+        val_log = validate(model, val_loader, criterion, device)
         scheduler.step()
 
         enc = model.cross_encoder
@@ -304,27 +330,41 @@ def main():
             torch.sigmoid(enc.freq3.low_logit).mean().item(),
         ]
 
-        print(
-            f"Epoch [{epoch:03d}/{CFG['epochs']}]"
-            f"  train={train_log['total']:.4f}"
-            f"  val={val_log['total']:.4f}"
-            f"  brown={val_log['brown']:.4f}"
-            f"  red={val_log['red']:.4f}"
-            f"  wrinkle={val_log['wrinkle']:.4f}"
-            f"  recon={val_log['recon']:.4f}"
-            f"  low_gate=[{low_gates[0]:.3f},{low_gates[1]:.3f},{low_gates[2]:.3f}]"
-            f"  lr={scheduler.get_last_lr()[0]:.2e}"
+        is_best = val_log['total'] < best_val
+        marker  = ' ★' if is_best else ''
+
+        # 에폭 bar에 핵심 수치 표시
+        epoch_bar.set_postfix(
+            train=f"{train_log['total']:.4f}",
+            val=f"{val_log['total']:.4f}",
+            brown=f"{val_log['brown']:.4f}",
+            red=f"{val_log['red']:.4f}",
+            wrinkle=f"{val_log['wrinkle']:.4f}",
         )
 
-        if val_log['total'] < best_val:
-            best_val  = val_log['total']
+        # 한 줄 요약 (tqdm 아래에 출력)
+        tqdm.write(
+            f"[{epoch:03d}/{CFG['epochs']}]"
+            f"  trn={train_log['total']:.4f}"
+            f"  val={val_log['total']:.4f}"
+            f"  B={val_log['brown']:.4f}"
+            f"  R={val_log['red']:.4f}"
+            f"  W={val_log['wrinkle']:.4f}"
+            f"  rc={val_log['recon']:.4f}"
+            f"  gate=[{low_gates[0]:.3f},{low_gates[1]:.3f},{low_gates[2]:.3f}]"
+            f"  lr={scheduler.get_last_lr()[0]:.2e}"
+            f"{marker}"
+        )
+
+        if is_best:
+            best_val = val_log['total']
             torch.save({
                 'epoch'     : epoch,
                 'state_dict': model.state_dict(),
                 'val_loss'  : val_log,
                 'cfg'       : CFG,
             }, Path(CFG['checkpoint_dir']) / 'best_skin_analyzer.pth')
-            print(f"  Best 저장: val={best_val:.4f}")
+            tqdm.write(f"  ★ Best 저장: val={best_val:.4f}")
 
         # 학습 제외 이미지 예측 결과 시각화
         if (preview_loader is not None
@@ -333,10 +373,11 @@ def main():
             save_preview(
                 model, preview_loader, device,
                 epoch,
-                save_dir  = Path(CFG['preview_dir']),
-                n_images  = CFG['preview_n_images'],
+                save_dir = Path(CFG['preview_dir']),
+                n_images = CFG['preview_n_images'],
             )
 
+    epoch_bar.close()
     print("\n학습 완료!")
 
 
