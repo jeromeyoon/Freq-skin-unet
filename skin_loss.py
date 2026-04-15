@@ -8,9 +8,18 @@ GT가 없는 샘플은 해당 task loss를 0으로 처리.
 
 Beer-Lambert recon은 교차 편광(rgb_cross)만 사용.
 
+Task별 Loss
+-----------
+  brown / red : BCE + Dice
+    - BCE  : 픽셀별 확률 오차 (불균형 처리에 적합)
+    - Dice : 영역 겹침 최대화 (희소 병변에 강인)
+  wrinkle     : Focal + Dice
+    - Focal: 어려운 예측(얇은 선)에 가중치 집중 (gamma=2, alpha=0.25)
+    - Dice : 미세 구조 겹침 최대화
+
 학습 단계
 ---------
-Phase 1 (0~40%) : supervised L1 + Beer-Lambert recon
+Phase 1 (0~40%) : supervised (BCE/Focal+Dice) + Beer-Lambert recon
 Phase 2 (40~80%): + illumination consistency
 Phase 3 (80~100%): + freq gate regularization
 """
@@ -23,6 +32,56 @@ from skin_net import SkinResult
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 기본 Loss 함수
+# ══════════════════════════════════════════════════════════════════════════════
+def _dice_loss_per_sample(pred:      torch.Tensor,
+                          gt:        torch.Tensor,
+                          face_mask: torch.Tensor,
+                          smooth:    float = 1.0) -> torch.Tensor:
+    """
+    샘플별 Dice Loss 반환.  [B] 크기 텐서.
+
+    pred / gt / face_mask : [B, 1, H, W]
+    """
+    # 피부 영역 내 픽셀만 고려
+    p = pred * face_mask              # [B,1,H,W]
+    g = gt   * face_mask              # [B,1,H,W]
+
+    # 샘플별 합산 → [B]
+    inter  = (p * g).flatten(1).sum(1)
+    p_sum  = p.flatten(1).sum(1)
+    g_sum  = g.flatten(1).sum(1)
+
+    dice = 1.0 - (2.0 * inter + smooth) / (p_sum + g_sum + smooth)
+    return dice                        # [B]
+
+
+def _bce_per_pixel(pred:      torch.Tensor,
+                   gt:        torch.Tensor,
+                   face_mask: torch.Tensor) -> torch.Tensor:
+    """BCE를 피부 영역에만 적용. [B,1,H,W] 반환."""
+    bce = F.binary_cross_entropy(pred, gt, reduction='none')
+    return bce * face_mask             # [B,1,H,W]
+
+
+def _focal_per_pixel(pred:      torch.Tensor,
+                     gt:        torch.Tensor,
+                     face_mask: torch.Tensor,
+                     gamma:     float = 2.0,
+                     alpha:     float = 0.25) -> torch.Tensor:
+    """
+    Focal Loss를 피부 영역에만 적용. [B,1,H,W] 반환.
+
+    gamma : 어려운 샘플 집중 계수 (2.0 권장)
+    alpha : 양성 가중치 (주름 희소성 보완)
+    """
+    bce   = F.binary_cross_entropy(pred, gt, reduction='none')  # [B,1,H,W]
+    p_t   = torch.where(gt > 0.5, pred, 1.0 - pred)             # 예측 확률
+    focal = alpha * (1.0 - p_t) ** gamma * bce
+    return focal * face_mask           # [B,1,H,W]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SkinAnalyzerLoss
 # ══════════════════════════════════════════════════════════════════════════════
 class SkinAnalyzerLoss(nn.Module):
@@ -31,46 +90,103 @@ class SkinAnalyzerLoss(nn.Module):
     _HEM_ABS = [0.10, 0.35, 0.05]
 
     def __init__(self,
-                 w_brown:    float = 1.0,
-                 w_red:      float = 1.0,
-                 w_wrinkle:  float = 1.0,
-                 w_recon:    float = 0.3,
-                 w_consist:  float = 0.0,
-                 w_freq_reg: float = 0.0):
+                 w_brown:      float = 1.0,
+                 w_red:        float = 1.0,
+                 w_wrinkle:    float = 1.0,
+                 w_recon:      float = 0.3,
+                 w_consist:    float = 0.0,
+                 w_freq_reg:   float = 0.0,
+                 bce_dice_ratio: float = 0.5,   # BCE:Dice 비율 (brown/red)
+                 focal_gamma:  float = 2.0,
+                 focal_alpha:  float = 0.25):
         super().__init__()
-        self.w_brown    = w_brown
-        self.w_red      = w_red
-        self.w_wrinkle  = w_wrinkle
-        self.w_recon    = w_recon
-        self.w_consist  = w_consist
-        self.w_freq_reg = w_freq_reg
+        self.w_brown      = w_brown
+        self.w_red        = w_red
+        self.w_wrinkle    = w_wrinkle
+        self.w_recon      = w_recon
+        self.w_consist    = w_consist
+        self.w_freq_reg   = w_freq_reg
+        self.bce_ratio    = bce_dice_ratio   # α·BCE + (1-α)·Dice
+        self.focal_gamma  = focal_gamma
+        self.focal_alpha  = focal_alpha
 
         self.register_buffer('mel_abs',
                              torch.tensor(self._MEL_ABS).view(1, 3, 1, 1))
         self.register_buffer('hem_abs',
                              torch.tensor(self._HEM_ABS).view(1, 3, 1, 1))
 
-    # ── 부분 GT L1 ──────────────────────────────────────────────────────────
-    def _partial_l1(self,
-                    pred:     torch.Tensor,
-                    gt:       torch.Tensor,
-                    face_mask:torch.Tensor,
-                    has_gt:   list[bool]) -> torch.Tensor:
+    # ── brown / red : BCE + Dice ─────────────────────────────────────────────
+    def _bce_dice(self,
+                  pred:      torch.Tensor,
+                  gt:        torch.Tensor,
+                  face_mask: torch.Tensor,
+                  has_gt:    list[bool]) -> torch.Tensor:
         """
-        배치 내 GT가 있는 샘플만 loss 계산.
+        BCE + Dice (부분 GT 지원)
 
-        pred      : [B,1,H,W]
-        gt        : [B,1,H,W]  (GT 없는 샘플은 zeros)
-        face_mask : [B,1,H,W]
-        has_gt    : list[bool]  길이 B
+        pred / gt / face_mask : [B,1,H,W]
+        has_gt                : list[bool] 길이 B
         """
-        # GT 가용 마스크 [B,1,1,1]
         gt_avail = torch.tensor(has_gt, dtype=torch.float32,
                                 device=pred.device).view(-1, 1, 1, 1)
 
-        # 픽셀 단위 L1 × face_mask × GT 가용 여부
+        # ── BCE ───────────────────────────────────────────────────────────────
+        bce_map = _bce_per_pixel(pred, gt, face_mask)              # [B,1,H,W]
+        bce_map = bce_map * gt_avail
+        denom_pix = (face_mask * gt_avail).sum().clamp(min=1.0)
+        l_bce = bce_map.sum() / denom_pix
+
+        # ── Dice ──────────────────────────────────────────────────────────────
+        dice_per = _dice_loss_per_sample(pred, gt, face_mask)      # [B]
+        avail_1d = torch.tensor(has_gt, dtype=torch.float32,
+                                device=pred.device)
+        n_valid  = avail_1d.sum().clamp(min=1.0)
+        l_dice   = (dice_per * avail_1d).sum() / n_valid
+
+        return self.bce_ratio * l_bce + (1.0 - self.bce_ratio) * l_dice
+
+    # ── wrinkle : Focal + Dice ────────────────────────────────────────────────
+    def _focal_dice(self,
+                    pred:      torch.Tensor,
+                    gt:        torch.Tensor,
+                    face_mask: torch.Tensor,
+                    has_gt:    list[bool]) -> torch.Tensor:
+        """
+        Focal + Dice (부분 GT 지원)
+
+        pred / gt / face_mask : [B,1,H,W]
+        has_gt                : list[bool] 길이 B
+        """
+        gt_avail = torch.tensor(has_gt, dtype=torch.float32,
+                                device=pred.device).view(-1, 1, 1, 1)
+
+        # ── Focal ─────────────────────────────────────────────────────────────
+        focal_map = _focal_per_pixel(pred, gt, face_mask,
+                                     self.focal_gamma, self.focal_alpha)
+        focal_map = focal_map * gt_avail
+        denom_pix = (face_mask * gt_avail).sum().clamp(min=1.0)
+        l_focal   = focal_map.sum() / denom_pix
+
+        # ── Dice ──────────────────────────────────────────────────────────────
+        dice_per = _dice_loss_per_sample(pred, gt, face_mask)      # [B]
+        avail_1d = torch.tensor(has_gt, dtype=torch.float32,
+                                device=pred.device)
+        n_valid  = avail_1d.sum().clamp(min=1.0)
+        l_dice   = (dice_per * avail_1d).sum() / n_valid
+
+        return self.bce_ratio * l_focal + (1.0 - self.bce_ratio) * l_dice
+
+    # ── Consistency용 내부 L1 (augmentation 비교) ────────────────────────────
+    def _partial_l1(self,
+                    pred:      torch.Tensor,
+                    gt:        torch.Tensor,
+                    face_mask: torch.Tensor,
+                    has_gt:    list[bool]) -> torch.Tensor:
+        """조명 consistency loss에서 augmented 예측끼리 비교 시 사용."""
+        gt_avail  = torch.tensor(has_gt, dtype=torch.float32,
+                                 device=pred.device).view(-1, 1, 1, 1)
         per_pixel = F.l1_loss(pred, gt, reduction='none') * face_mask * gt_avail
-        denom = (face_mask * gt_avail).sum().clamp(min=1.0)
+        denom     = (face_mask * gt_avail).sum().clamp(min=1.0)
         return per_pixel.sum() / denom
 
     # ── Beer-Lambert recon ──────────────────────────────────────────────────
@@ -129,12 +245,14 @@ class SkinAnalyzerLoss(nn.Module):
         """
         detail = {}
 
-        # ── Supervised L1 (부분) ─────────────────────────────────────────────
-        l_brown = self._partial_l1(
+        # ── Supervised (부분) ────────────────────────────────────────────────
+        # brown / red : BCE + Dice
+        l_brown = self._bce_dice(
             result.brown_mask,   brown_gt,   face_mask, has_brown)
-        l_red = self._partial_l1(
+        l_red = self._bce_dice(
             result.red_mask,     red_gt,     face_mask, has_red)
-        l_wrinkle = self._partial_l1(
+        # wrinkle : Focal + Dice
+        l_wrinkle = self._focal_dice(
             result.wrinkle_mask, wrinkle_gt, face_mask, has_wrinkle)
 
         detail.update(brown=l_brown.item(), red=l_red.item(), wrinkle=l_wrinkle.item())
