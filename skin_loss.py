@@ -270,7 +270,6 @@ class SkinAnalyzerLoss(nn.Module):
         detail.update(brown=l_brown.item(), red=l_red.item(), wrinkle=l_wrinkle.item())
 
         # 유효한 task만 loss에 합산 (모두 0인 경우 방지)
-        n_active = sum([any(has_brown), any(has_red), any(has_wrinkle)])
         loss = torch.tensor(0.0, device=rgb_cross.device)
         if any(has_brown):
             loss = loss + self.w_brown   * l_brown
@@ -280,21 +279,26 @@ class SkinAnalyzerLoss(nn.Module):
             loss = loss + self.w_wrinkle * l_wrinkle
 
         # ── Beer-Lambert recon ───────────────────────────────────────────────
-        l_recon = self._beer_lambert_recon(
-            result.brown_mask, result.red_mask, rgb_cross, face_mask,
-            has_brown, has_red)
-        detail['recon'] = l_recon.item()
-        loss = loss + self.w_recon * l_recon
+        if self.w_recon > 0:
+            l_recon = self._beer_lambert_recon(
+                result.brown_mask, result.red_mask, rgb_cross, face_mask,
+                has_brown, has_red)
+            detail['recon'] = l_recon.item()
+            loss = loss + self.w_recon * l_recon
+        else:
+            detail['recon'] = 0.0
 
         # ── Consistency ──────────────────────────────────────────────────────
+        # result(원본)을 pred로, result_aug(증강)을 pseudo-GT로 사용.
+        # result_aug는 grad 있음, result는 detach → 원본 예측을 기준점으로 고정.
         if self.w_consist > 0 and result_aug is not None:
             l_consist = (
                 self._partial_l1(result_aug.brown_mask,
-                                 result.brown_mask.detach(), face_mask, has_brown) +
+                                 result.brown_mask.detach(),   face_mask, has_brown) +
                 self._partial_l1(result_aug.red_mask,
-                                 result.red_mask.detach(),   face_mask, has_red)   +
+                                 result.red_mask.detach(),     face_mask, has_red)   +
                 self._partial_l1(result_aug.wrinkle_mask,
-                                 result.wrinkle_mask.detach(),face_mask, has_wrinkle)
+                                 result.wrinkle_mask.detach(), face_mask, has_wrinkle)
             ) / 3.0
             detail['consist'] = l_consist.item()
             loss = loss + self.w_consist * l_consist

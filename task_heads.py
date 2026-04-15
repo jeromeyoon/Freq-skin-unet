@@ -137,7 +137,7 @@ class WrinkleHead(nn.Module):
     주름 예측
 
     고주파 텍스처 feature를 multi-scale로 concat 후 예측.
-    주름은 고주파 성분이므로 texture skips를 사용.
+    bottleneck을 통해 global context 반영.
 
     입력
     ----
@@ -145,6 +145,7 @@ class WrinkleHead(nn.Module):
                     t1: [B, ch,   H,   W]
                     t2: [B, ch*2, H/2, H/2]
                     t3: [B, ch*4, H/4, H/4]
+    bottleneck    : [B, ch*8, H/8, H/8]  — global context
     skin_mask     : [B, 1, H, W]  (optional)
 
     출력
@@ -156,7 +157,18 @@ class WrinkleHead(nn.Module):
     def __init__(self, base_ch: int = 64):
         super().__init__()
         ch = base_ch
-        fused_ch = ch + ch * 2 + ch * 4   # 모든 레벨 concat
+
+        # bottleneck → t3 해상도로 업샘플 후 t3와 concat
+        self.up_bottleneck = nn.Sequential(
+            nn.ConvTranspose2d(ch * 8, ch * 4, kernel_size=2, stride=2),
+            nn.BatchNorm2d(ch * 4),
+            nn.ReLU(inplace=True),
+        )
+
+        # bottleneck_up + t3 → ch*4
+        self.merge_bot = ConvBlock(ch * 4 + ch * 4, ch * 4)
+
+        fused_ch = ch + ch * 2 + ch * 4   # t1 + t2_up + merged_t3
 
         self.fuse = nn.Sequential(
             nn.Conv2d(fused_ch, ch, kernel_size=3, padding=1, bias=False),
@@ -170,15 +182,23 @@ class WrinkleHead(nn.Module):
 
     def forward(self,
                 texture_feats: list,
+                bottleneck: torch.Tensor,
                 skin_mask: torch.Tensor | None = None):
         t1, t2, t3 = texture_feats   # fine → coarse
 
+        # bottleneck → t3 해상도로 업샘플 후 merge
+        bot_up = self.up_bottleneck(bottleneck)   # [B, ch*4, H/4, H/4]
+        if bot_up.shape != t3.shape:
+            bot_up = F.interpolate(bot_up, size=t3.shape[2:],
+                                   mode='bilinear', align_corners=False)
+        t3_merged = self.merge_bot(torch.cat([bot_up, t3], dim=1))  # [B, ch*4, H/4, H/4]
+
         # 모든 레벨을 t1 해상도로 업샘플 후 concat
         target_h, target_w = t1.shape[2], t1.shape[3]
-        t2_up = F.interpolate(t2, size=(target_h, target_w),
-                              mode='bilinear', align_corners=False)
-        t3_up = F.interpolate(t3, size=(target_h, target_w),
-                              mode='bilinear', align_corners=False)
+        t2_up     = F.interpolate(t2,        size=(target_h, target_w),
+                                  mode='bilinear', align_corners=False)
+        t3_up     = F.interpolate(t3_merged, size=(target_h, target_w),
+                                  mode='bilinear', align_corners=False)
 
         fused = torch.cat([t1, t2_up, t3_up], dim=1)   # [B, fused_ch, H, W]
         logit = self.fuse(fused)                           # [B, 1, H, W]  raw logit

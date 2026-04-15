@@ -158,13 +158,14 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg, epoch, tot
 
         result = model(rgb_cross, rgb_parallel, mask)
 
-        # Consistency augmentation
+        # Consistency augmentation:
+        # 증강 이미지로 forward pass (grad 필요) → 원본 예측을 pseudo-GT로 비교.
+        # result_aug: grad 있음 / result: detach → 증강 예측이 원본에 가까워지도록 학습.
         result_aug = None
         if criterion.w_consist > 0:
             rgb_cross_aug    = apply_batch_illumination_aug(rgb_cross,    **aug_kwargs)
             rgb_parallel_aug = apply_batch_illumination_aug(rgb_parallel, **aug_kwargs)
-            with torch.no_grad():
-                result_aug = model(rgb_cross_aug, rgb_parallel_aug, mask)
+            result_aug = model(rgb_cross_aug, rgb_parallel_aug, mask)
 
         loss, detail = criterion(
             result,

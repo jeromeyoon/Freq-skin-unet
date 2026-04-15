@@ -106,19 +106,32 @@ class FrequencyGate(nn.Module):
         B, C, H, W = x.shape
         F_shift = torch.fft.fftshift(torch.fft.fft2(x))  # [B, C, H, W] complex
 
+        low_mask  = self._radial_mask(H, W, 0.0,        self.low_r,  x.device)
         mid_mask  = self._radial_mask(H, W, self.low_r,  self.high_r, x.device)
         high_mask = self._radial_mask(H, W, self.high_r, 1.0,         x.device)
 
-        gate_mid  = torch.sigmoid(self.mid_logit)   # [1, C, 1, 1]
+        # gate_low → 0에 가까울수록 조명(저주파) 성분 억제
+        gate_low  = torch.sigmoid(self.low_logit)   # [1, C, 1, 1]
+        gate_mid  = torch.sigmoid(self.mid_logit)
         gate_high = torch.sigmoid(self.high_logit)
 
-        x_chroma  = torch.fft.ifft2(
-            torch.fft.ifftshift(F_shift * mid_mask)
-        ).real * gate_mid
+        x_low = torch.fft.ifft2(
+            torch.fft.ifftshift(F_shift * low_mask)
+        ).real
 
-        x_texture = torch.fft.ifft2(
+        x_mid = torch.fft.ifft2(
+            torch.fft.ifftshift(F_shift * mid_mask)
+        ).real
+
+        x_high = torch.fft.ifft2(
             torch.fft.ifftshift(F_shift * high_mask)
-        ).real * gate_high
+        ).real
+
+        # 발색단(chroma): 중간 주파수 보존 + 저주파(조명) 억제
+        x_chroma  = x_mid * gate_mid - x_low * gate_low
+
+        # 텍스처: 고주파 보존
+        x_texture = x_high * gate_high
 
         return x_chroma, x_texture
 

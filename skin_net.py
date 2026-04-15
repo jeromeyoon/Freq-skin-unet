@@ -117,7 +117,7 @@ class SkinAnalyzer(nn.Module):
             cross_out.chroma, cross_out.bottleneck, skin_mask)
 
         wrinkle_mask, wrinkle_score = self.wrinkle_head(
-            parallel_out.texture, skin_mask)
+            parallel_out.texture, parallel_out.bottleneck, skin_mask)
 
         return SkinResult(
             brown_mask    = brown_mask,
