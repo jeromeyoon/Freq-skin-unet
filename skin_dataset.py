@@ -69,6 +69,19 @@ class SkinDataset(Dataset):
                 for stem in self.stems
             }
 
+        # brown / red / wrinkle 이 전부 False인 패치 제외
+        # → 어떤 GT도 없는 샘플은 지도학습 신호가 없으므로 학습 불필요
+        before = len(self.stems)
+        self.stems = [
+            stem for stem in self.stems
+            if any(self.manifest[stem].get(f'has_{t}', False)
+                   for t in ('brown', 'red', 'wrinkle'))
+        ]
+        excluded = before - len(self.stems)
+        if excluded:
+            print(f"[SkinDataset] GT 없는 패치 {excluded}개 제외 "
+                  f"({before} → {len(self.stems)})")
+
         assert len(self.stems) > 0, f"패치를 찾을 수 없습니다: {patch_dir}"
 
     def __len__(self):
