@@ -23,8 +23,13 @@ ID 매칭 전략 (우선순위 순)
 
 얼굴 마스크 생성
 -----------------
-MediaPipe Face Mesh로 얼굴 윤곽선 폴리곤 → 귀·목 자동 제외
+MediaPipe Face Mesh로 얼굴 윤곽선 폴리곤 → 귀·목·눈·눈썹 자동 제외
 MediaPipe 미설치 시 → 이미지 중앙 타원형 fallback
+
+패치 추출 원칙
+--------------
+마스크 영역(bounding box) 내에서만 슬라이딩 윈도우 실행.
+min_mask_coverage 이상의 마스크 비율을 가진 패치만 저장.
 
 출력 구조
 ---------
@@ -136,12 +141,20 @@ def find_matching_gt(input_name: str,
 # ══════════════════════════════════════════════════════════════════════════════
 # 얼굴 마스크 생성
 # ══════════════════════════════════════════════════════════════════════════════
-# MediaPipe Face Mesh의 얼굴 윤곽선 랜드마크 인덱스
+# MediaPipe Face Mesh 랜드마크 인덱스
 _FACE_OVAL = [
     10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
     397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
     172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109,
 ]
+
+# 눈·눈썹 제외 영역 (피부 분석 불필요)
+_LEFT_EYE      = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+_RIGHT_EYE     = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+_LEFT_EYEBROW  = [70, 63, 105, 66, 107, 55, 65, 52, 53, 46]
+_RIGHT_EYEBROW = [300, 293, 334, 296, 336, 285, 295, 282, 283, 276]
+
+_EXCLUDE_REGIONS = [_LEFT_EYE, _RIGHT_EYE, _LEFT_EYEBROW, _RIGHT_EYEBROW]
 
 
 def _try_import_mediapipe():
@@ -155,8 +168,10 @@ def _try_import_mediapipe():
 def generate_face_mask_mediapipe(img_bgr: np.ndarray,
                                  mp_face_mesh) -> np.ndarray | None:
     """
-    MediaPipe Face Mesh로 얼굴 윤곽선 마스크 생성.
-    성공 시 uint8 [H,W] (얼굴=255, 배경=0), 실패 시 None.
+    MediaPipe Face Mesh로 얼굴 마스크 생성.
+    - 얼굴 윤곽선 폴리곤 채움 → 귀·목 침식 제거
+    - 눈·눈썹 영역 팽창 후 제거
+    성공 시 uint8 [H,W] (유효 피부=255, 나머지=0), 실패 시 None.
     """
     H, W = img_bgr.shape[:2]
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -174,18 +189,27 @@ def generate_face_mask_mediapipe(img_bgr: np.ndarray,
 
     lm = results.multi_face_landmarks[0].landmark
 
-    # 얼굴 윤곽선 좌표 (픽셀 단위)
-    pts = np.array([
-        [int(lm[i].x * W), int(lm[i].y * H)]
-        for i in _FACE_OVAL
-    ], dtype=np.int32)
+    def lm_pts(indices):
+        return np.array(
+            [[int(lm[i].x * W), int(lm[i].y * H)] for i in indices],
+            dtype=np.int32,
+        )
 
+    # ── 1. 얼굴 윤곽선 마스크 ────────────────────────────────────────────────
     mask = np.zeros((H, W), dtype=np.uint8)
-    cv2.fillPoly(mask, [pts], 255)
+    cv2.fillPoly(mask, [lm_pts(_FACE_OVAL)], 255)
 
-    # 형태학적 침식으로 경계 정리 (귀 근처 제거)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    mask   = cv2.erode(mask, kernel, iterations=2)
+    # 침식으로 귀·목 경계 제거
+    k_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mask    = cv2.erode(mask, k_erode, iterations=2)
+
+    # ── 2. 눈·눈썹 영역 제거 ────────────────────────────────────────────────
+    k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (12, 12))
+    for indices in _EXCLUDE_REGIONS:
+        excl = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(excl, [lm_pts(indices)], 255)
+        excl = cv2.dilate(excl, k_dilate, iterations=1)   # 여유 패딩
+        mask = cv2.bitwise_and(mask, cv2.bitwise_not(excl))
 
     return mask
 
@@ -248,23 +272,49 @@ def load_gray(path: Path, target_hw: tuple | None = None) -> np.ndarray:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 패치 추출
+# 패치 추출 (마스크 영역 한정)
 # ══════════════════════════════════════════════════════════════════════════════
-def extract_patches(arr: np.ndarray,
-                    patch_size: int,
-                    stride: int) -> list[tuple[np.ndarray, tuple]]:
-    """슬라이딩 윈도우 패치. 반환: [(patch, (y, x)), ...]"""
-    H, W = arr.shape[:2]
-    patches = []
-    for y in range(0, H - patch_size + 1, stride):
-        for x in range(0, W - patch_size + 1, stride):
-            patches.append((arr[y:y+patch_size, x:x+patch_size], (y, x)))
-    return patches
+def find_valid_positions(face_mask: np.ndarray,
+                         patch_size: int,
+                         stride: int,
+                         min_coverage: float = 0.7) -> list[tuple[int, int]]:
+    """
+    마스크 bounding box 내에서만 슬라이딩 윈도우를 실행하고,
+    패치 내 마스크 비율이 min_coverage 이상인 위치만 반환.
+
+    반환: [(y, x), ...]
+    """
+    H, W = face_mask.shape[:2]
+    binary = face_mask > 127
+
+    # 마스크 bounding box
+    rows = np.any(binary, axis=1)
+    cols = np.any(binary, axis=0)
+    if not rows.any():
+        return []
+
+    r_min = int(np.where(rows)[0][0])
+    r_max = int(np.where(rows)[0][-1])
+    c_min = int(np.where(cols)[0][0])
+    c_max = int(np.where(cols)[0][-1])
+
+    positions = []
+    for y in range(r_min, r_max - patch_size + 2, stride):
+        if y + patch_size > H:
+            break
+        for x in range(c_min, c_max - patch_size + 2, stride):
+            if x + patch_size > W:
+                break
+            patch_mask = binary[y:y+patch_size, x:x+patch_size]
+            if patch_mask.mean() >= min_coverage:
+                positions.append((y, x))
+
+    return positions
 
 
-def mask_coverage(mask_patch: np.ndarray, threshold: float) -> bool:
-    """패치 내 마스크 커버리지가 threshold 이상이면 True"""
-    return (mask_patch > 127).mean() >= threshold
+def crop_patch(arr: np.ndarray, y: int, x: int, patch_size: int) -> np.ndarray:
+    """배열에서 (y,x) 위치의 패치 반환"""
+    return arr[y:y+patch_size, x:x+patch_size]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -275,12 +325,13 @@ def prepare(input_path:       str,
             patch_dir:        str,
             patch_size:       int   = 256,
             stride:           int   = 256,
-            min_mask_coverage: float = 0.3):
+            min_mask_coverage: float = 0.7):
     """
     Parameters
     ----------
-    min_mask_coverage : 패치 저장 최소 얼굴 마스크 비율 (0~1)
-                        0.3 → 패치의 30% 이상이 얼굴 영역이어야 저장
+    min_mask_coverage : 패치 저장 최소 얼굴 마스크 비율 (0~1).
+                        마스크 bounding box 내에서만 슬라이딩 윈도우를 실행하므로
+                        기본값 0.7 (70% 이상이 유효 피부 영역이어야 저장).
     """
     input_root = Path(input_path)
     gt_root    = Path(gt_path)
@@ -339,23 +390,15 @@ def prepare(input_path:       str,
             if gt_p is not None:
                 gt_arrays[task] = load_gray(gt_p, target_hw=(H, W))
 
-        # 패치 추출
-        cross_patches    = extract_patches(cross_bgr,    patch_size, stride)
-        parallel_patches = extract_patches(parallel_bgr, patch_size, stride)
-        mask_patches     = extract_patches(face_mask,    patch_size, stride)
-
-        gt_patch_lists = {
-            task: extract_patches(arr, patch_size, stride)
-            for task, arr in gt_arrays.items()
-        }
+        # 마스크 bounding box 내에서 유효 위치 탐색
+        valid_positions = find_valid_positions(
+            face_mask, patch_size, stride, min_mask_coverage)
 
         saved = 0
-        for idx, ((c_p, pos), (p_p, _), (m_p, _)) in enumerate(
-                zip(cross_patches, parallel_patches, mask_patches)):
-
-            # 얼굴 마스크 커버리지 필터
-            if not mask_coverage(m_p, min_mask_coverage):
-                continue
+        for idx, (y, x) in enumerate(valid_positions):
+            c_p = crop_patch(cross_bgr,    y, x, patch_size)
+            p_p = crop_patch(parallel_bgr, y, x, patch_size)
+            m_p = crop_patch(face_mask,    y, x, patch_size)
 
             stem = f'{subject_name}_{idx:04d}'
 
@@ -365,15 +408,15 @@ def prepare(input_path:       str,
             Image.fromarray(m_p, mode='L').save(out_root / 'mask' / f'{stem}.png')
 
             for task in ['brown', 'red', 'wrinkle']:
-                if task in gt_patch_lists:
-                    gt_p_arr = gt_patch_lists[task][idx][0]
+                if task in gt_arrays:
+                    gt_p_arr = crop_patch(gt_arrays[task], y, x, patch_size)
                     Image.fromarray(gt_p_arr, mode='L').save(
                         out_root / task / f'{stem}.png')
 
             manifest[stem] = {
                 'subject_name': subject_name,
                 'patch_idx'   : idx,
-                'patch_pos'   : list(pos),
+                'patch_pos'   : [y, x],
                 'has_brown'   : has_gt['brown'],
                 'has_red'     : has_gt['red'],
                 'has_wrinkle' : has_gt['wrinkle'],
@@ -409,8 +452,8 @@ if __name__ == '__main__':
     parser.add_argument('--patch_dir',   default='./patches')
     parser.add_argument('--patch_size',  type=int,   default=256)
     parser.add_argument('--stride',      type=int,   default=256)
-    parser.add_argument('--min_mask_coverage', type=float, default=0.3,
-                        help='패치 저장 최소 얼굴 마스크 비율 (기본 0.3)')
+    parser.add_argument('--min_mask_coverage', type=float, default=0.7,
+                        help='패치 저장 최소 얼굴 마스크 비율 (기본 0.7)')
     args = parser.parse_args()
 
     prepare(
