@@ -1,0 +1,969 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FreqAwareUNet — 조명 불변 피부 분석</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Noto+Sans+KR:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   MANDATORY VIEWPORT BASE
+   ============================================================ */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%; overflow-x: hidden;
+  background: #060a14;
+}
+html {
+  scroll-snap-type: y mandatory;
+  scroll-behavior: smooth;
+}
+
+:root {
+  --bg:        #060a14;
+  --bg2:       #0d1526;
+  --cyan:      #00d4ff;
+  --magenta:   #ff0080;
+  --gold:      #ffd700;
+  --text:      #d8e8ff;
+  --muted:     #7a92b8;
+  --card:      rgba(0,212,255,0.06);
+  --border:    rgba(0,212,255,0.18);
+  --glow-c:    rgba(0,212,255,0.25);
+  --glow-m:    rgba(255,0,128,0.18);
+
+  --title-size: clamp(1.8rem, 5.5vw, 4.2rem);
+  --h2-size:    clamp(1.3rem, 3.5vw, 2.4rem);
+  --h3-size:    clamp(1rem,   2.5vw, 1.6rem);
+  --body-size:  clamp(0.78rem,1.4vw, 1.05rem);
+  --small-size: clamp(0.65rem,1vw,  0.85rem);
+  --mono-size:  clamp(0.7rem, 1.2vw, 0.92rem);
+  --slide-pad:  clamp(1.5rem, 5vw,  5rem);
+  --gap:        clamp(0.5rem, 1.8vw, 1.5rem);
+}
+
+.slide {
+  width: 100vw; height: 100vh; height: 100dvh;
+  overflow: hidden;
+  scroll-snap-align: start;
+  display: flex; flex-direction: column;
+  position: relative;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Space Grotesk','Noto Sans KR',sans-serif;
+}
+
+/* Grid background */
+.slide::before {
+  content: '';
+  position: absolute; inset: 0;
+  background-image:
+    linear-gradient(rgba(0,212,255,0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,212,255,0.04) 1px, transparent 1px);
+  background-size: 50px 50px;
+  pointer-events: none; z-index: 0;
+}
+
+.slide-inner {
+  position: relative; z-index: 1;
+  flex: 1; display: flex; flex-direction: column;
+  justify-content: center;
+  padding: var(--slide-pad);
+  max-height: 100%;
+  overflow: hidden;
+}
+
+/* ============================================================
+   TYPOGRAPHY
+   ============================================================ */
+.title-xl {
+  font-size: var(--title-size);
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
+.title-xl .accent { color: var(--cyan); }
+.title-xl .accent2 { color: var(--magenta); }
+
+h2.slide-title {
+  font-size: var(--h2-size);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin-bottom: var(--gap);
+}
+h2.slide-title .num {
+  font-family: 'Space Mono', monospace;
+  color: var(--cyan);
+  font-size: 0.6em;
+  margin-right: 0.4em;
+  opacity: 0.7;
+}
+
+.sub { font-size: var(--body-size); color: var(--muted); margin-top: 0.4em; }
+.tag {
+  display: inline-block;
+  font-family: 'Space Mono', monospace;
+  font-size: var(--small-size);
+  padding: 0.25em 0.75em;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  color: var(--cyan);
+  background: var(--card);
+  letter-spacing: 0.08em;
+}
+
+/* ============================================================
+   CARDS & GRID
+   ============================================================ */
+.card-grid {
+  display: grid;
+  gap: clamp(0.5rem, 1.2vw, 1rem);
+  max-height: min(70vh, 600px);
+}
+.card-grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+.card-grid.cols-2 { grid-template-columns: repeat(2, 1fr); }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: clamp(0.8rem, 1.5vw, 1.4rem);
+  position: relative;
+  overflow: hidden;
+}
+.card::before {
+  content: '';
+  position: absolute; top: 0; left: 0;
+  width: 3px; height: 100%;
+  background: var(--cyan);
+}
+.card.magenta::before { background: var(--magenta); }
+.card.gold::before    { background: var(--gold); }
+
+.card-icon {
+  font-size: clamp(1.4rem, 2.5vw, 2rem);
+  margin-bottom: 0.4em;
+}
+.card-title {
+  font-size: var(--h3-size);
+  font-weight: 600;
+  color: var(--cyan);
+  margin-bottom: 0.3em;
+}
+.card.magenta .card-title { color: var(--magenta); }
+.card.gold .card-title    { color: var(--gold); }
+.card-body { font-size: var(--body-size); color: var(--muted); line-height: 1.5; }
+
+/* ============================================================
+   BULLET LIST
+   ============================================================ */
+.bullet-list {
+  list-style: none;
+  display: flex; flex-direction: column;
+  gap: clamp(0.4rem, 1vh, 0.9rem);
+}
+.bullet-list li {
+  font-size: var(--body-size);
+  color: var(--text);
+  padding-left: 1.4em;
+  position: relative;
+  line-height: 1.5;
+}
+.bullet-list li::before {
+  content: '▸';
+  position: absolute; left: 0;
+  color: var(--cyan); font-size: 0.8em;
+  top: 0.15em;
+}
+.bullet-list li .hl  { color: var(--cyan);    font-weight: 600; }
+.bullet-list li .hlm { color: var(--magenta); font-weight: 600; }
+.bullet-list li .hlg { color: var(--gold);    font-weight: 600; }
+
+/* ============================================================
+   CODE BLOCK
+   ============================================================ */
+.code-block {
+  font-family: 'Space Mono', monospace;
+  font-size: var(--mono-size);
+  background: rgba(0,0,0,0.5);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: clamp(0.7rem, 1.5vw, 1.2rem);
+  line-height: 1.7;
+  color: #b0d8ff;
+  overflow: hidden;
+  max-height: 38vh;
+}
+.code-block .kw  { color: var(--magenta); }
+.code-block .fn  { color: var(--cyan); }
+.code-block .cm  { color: #4a6a8a; font-style: italic; }
+.code-block .st  { color: var(--gold); }
+.code-block .nm  { color: #7fdbff; }
+
+/* ============================================================
+   ARCH DIAGRAM
+   ============================================================ */
+.arch {
+  display: flex; flex-direction: column;
+  align-items: center;
+  gap: clamp(0.3rem, 0.8vh, 0.6rem);
+  font-family: 'Space Mono', monospace;
+  font-size: var(--mono-size);
+}
+.arch-row {
+  display: flex; align-items: center; gap: 0.6em;
+  flex-wrap: wrap; justify-content: center;
+}
+.arch-box {
+  padding: 0.35em 0.9em;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--cyan);
+  background: var(--card);
+  white-space: nowrap;
+  font-size: var(--mono-size);
+}
+.arch-box.mag  { border-color: rgba(255,0,128,0.4); color: var(--magenta); background: rgba(255,0,128,0.06); }
+.arch-box.gold { border-color: rgba(255,215,0,0.4);  color: var(--gold);    background: rgba(255,215,0,0.06); }
+.arch-box.key  {
+  border-color: var(--cyan);
+  box-shadow: 0 0 12px var(--glow-c);
+  color: #fff;
+  background: rgba(0,212,255,0.12);
+}
+.arch-arr { color: var(--muted); font-size: 1em; }
+.arch-branch { display: flex; gap: 0.6em; align-items: center; }
+
+/* ============================================================
+   FORMULA
+   ============================================================ */
+.formula {
+  font-family: 'Space Mono', monospace;
+  font-size: clamp(0.8rem, 1.6vw, 1.1rem);
+  background: rgba(0,0,0,0.4);
+  border-left: 3px solid var(--cyan);
+  padding: 0.6em 1.2em;
+  color: #a0d8ff;
+  border-radius: 0 4px 4px 0;
+  line-height: 1.8;
+}
+.formula .cyn { color: var(--cyan); }
+.formula .mag { color: var(--magenta); }
+.formula .gld { color: var(--gold); }
+
+/* ============================================================
+   PHASE TABLE
+   ============================================================ */
+.phase-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--body-size);
+}
+.phase-table th, .phase-table td {
+  padding: clamp(0.4rem, 1vh, 0.8rem) clamp(0.6rem, 1.5vw, 1.2rem);
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.phase-table th { color: var(--cyan); font-weight: 600; font-family: 'Space Mono', monospace; font-size: var(--small-size); }
+.phase-table td { color: var(--text); }
+.phase-table tr:last-child td { border-bottom: none; }
+.phase-table .p1 { color: #7fdbff; }
+.phase-table .p2 { color: #a78bfa; }
+.phase-table .p3 { color: var(--gold); }
+
+/* ============================================================
+   GLOW DECORATIONS
+   ============================================================ */
+.glow-orb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(80px);
+  pointer-events: none; z-index: 0;
+  opacity: 0.35;
+}
+
+/* ============================================================
+   NAVIGATION
+   ============================================================ */
+.nav-dots {
+  position: fixed; right: clamp(1rem, 2vw, 2rem); top: 50%;
+  transform: translateY(-50%);
+  display: flex; flex-direction: column; gap: 8px;
+  z-index: 100;
+}
+.nav-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--muted); cursor: pointer;
+  transition: all 0.3s;
+  border: none;
+}
+.nav-dot.active {
+  background: var(--cyan);
+  box-shadow: 0 0 8px var(--glow-c);
+  transform: scale(1.5);
+}
+
+.slide-num {
+  position: absolute; bottom: clamp(1rem, 2vh, 1.8rem);
+  right: clamp(1.5rem, 3vw, 3rem);
+  font-family: 'Space Mono', monospace;
+  font-size: var(--small-size);
+  color: var(--muted); z-index: 10;
+}
+
+.kbd-hint {
+  position: fixed; bottom: 1.2rem; left: 50%; transform: translateX(-50%);
+  font-family: 'Space Mono', monospace;
+  font-size: 0.65rem; color: rgba(120,145,184,0.4);
+  z-index: 100; pointer-events: none; letter-spacing: 0.06em;
+}
+
+/* ============================================================
+   ANIMATIONS
+   ============================================================ */
+.reveal { opacity: 0; transform: translateY(20px); transition: opacity 0.6s ease, transform 0.6s ease; }
+.reveal.in { opacity: 1; transform: none; }
+.reveal-d1 { transition-delay: 0.1s; }
+.reveal-d2 { transition-delay: 0.22s; }
+.reveal-d3 { transition-delay: 0.34s; }
+.reveal-d4 { transition-delay: 0.46s; }
+.reveal-d5 { transition-delay: 0.58s; }
+
+/* ============================================================
+   SHORT SCREEN OVERRIDES
+   ============================================================ */
+@media (max-height: 700px) {
+  :root {
+    --slide-pad: clamp(1rem, 3vw, 2.5rem);
+    --gap: clamp(0.35rem, 1.2vw, 0.9rem);
+    --title-size: clamp(1.5rem, 4.5vw, 2.8rem);
+    --h2-size: clamp(1.1rem, 3vw, 1.8rem);
+  }
+}
+@media (max-height: 600px) {
+  .nav-dots, .kbd-hint { display: none; }
+  :root {
+    --slide-pad: clamp(0.8rem, 2.5vw, 1.8rem);
+    --body-size: clamp(0.7rem, 1.2vw, 0.9rem);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.2s !important;
+  }
+  html { scroll-behavior: auto; }
+  .reveal { opacity: 1; transform: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- ============================================================
+     SLIDE 01: TITLE
+     ============================================================ -->
+<section class="slide" id="s1">
+  <div class="glow-orb" style="width:500px;height:500px;top:-15%;left:-10%;background:var(--cyan);"></div>
+  <div class="glow-orb" style="width:400px;height:400px;bottom:-20%;right:-5%;background:var(--magenta);"></div>
+  <div class="slide-inner" style="justify-content:center;gap:var(--gap);">
+    <div class="reveal">
+      <span class="tag">SKIN ANALYSIS · DEEP LEARNING · 2025</span>
+    </div>
+    <div class="reveal reveal-d1" style="margin-top:1rem;">
+      <div class="title-xl">
+        <span class="accent">Freq</span>Aware<br><span class="accent">U</span>Net
+      </div>
+    </div>
+    <div class="reveal reveal-d2" style="margin-top:0.6rem;">
+      <p style="font-size:var(--h3-size);color:var(--muted);font-weight:300;">
+        Frequency-aware Skip Connection U-Net<br>
+        <span style="color:var(--text);font-weight:500;">조명 불변 다중 피부 분석</span>
+      </p>
+    </div>
+    <div class="reveal reveal-d3" style="margin-top:1.4rem;display:flex;gap:0.8em;flex-wrap:wrap;">
+      <span class="tag">🧬 Melanin</span>
+      <span class="tag">🩸 Hemoglobin</span>
+      <span class="tag">〰 Wrinkle</span>
+      <span class="tag">☀ Illumination Robust</span>
+    </div>
+    <div class="reveal reveal-d4" style="margin-top:1rem;">
+      <p style="font-size:var(--small-size);color:var(--muted);font-family:'Space Mono',monospace;">
+        github.com/jeromeyoon/Freq-skin-unet
+      </p>
+    </div>
+  </div>
+  <div class="slide-num">01 / 12</div>
+</section>
+
+<!-- ============================================================
+     SLIDE 02: PROBLEM
+     ============================================================ -->
+<section class="slide" id="s2">
+  <div class="glow-orb" style="width:350px;height:350px;top:10%;right:5%;background:var(--magenta);opacity:0.2;"></div>
+  <div class="slide-inner">
+    <h2 class="slide-title reveal"><span class="num">02 —</span>문제 정의</h2>
+    <div class="card-grid cols-2 reveal reveal-d1" style="flex:1;max-height:72vh;">
+      <div class="card" style="display:flex;flex-direction:column;gap:0.6em;">
+        <div class="card-title">VISIA (기존 기기)</div>
+        <ul class="bullet-list">
+          <li><span class="hl">완전 통제된 조명</span> 환경</li>
+          <li>편광 필터, 표준광원 내장</li>
+          <li>고가의 전용 장비 필요</li>
+          <li>피부과 / 병원에서만 사용 가능</li>
+        </ul>
+      </div>
+      <div class="card magenta" style="display:flex;flex-direction:column;gap:0.6em;">
+        <div class="card-title">우리 기기 (목표)</div>
+        <ul class="bullet-list">
+          <li><span class="hlm">외부 조명 환경</span>에서 촬영</li>
+          <li>형광등, 자연광, LED 등 다양</li>
+          <li>조명에 따라 분석 결과 변동</li>
+          <li><span class="hlm">조명 불변 분석</span>이 핵심 과제</li>
+        </ul>
+      </div>
+    </div>
+    <div class="reveal reveal-d2" style="margin-top:var(--gap);">
+      <div class="formula">
+        <span class="mag">조명 변화</span> → RGB 값 변동 → <span class="mag">melanin/hemoglobin 오분류</span>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">02 / 12</div>
+</section>
+
+<!-- ============================================================
+     SLIDE 03: SKIN CHROMOPHORES
+     ============================================================ -->
+<section class="slide" id="s3">
+  <div class="glow-orb" style="width:300px;height:300px;bottom:0;left:30%;background:var(--gold);opacity:0.15;"></div>
+  <div class="slide-inner">
+    <h2 class="slide-title reveal"><span class="num">03 —</span>피부 발색단 (Chromophores)</h2>
+    <div class="card-grid cols-3 reveal reveal-d1" style="flex:1;max-height:68vh;">
+      <div class="card" style="display:flex;flex-direction:column;gap:0.5em;">
+        <div class="card-icon">🟤</div>
+        <div class="card-title">Melanin</div>
+        <div class="card-body">
+          갈색 색소<br>
+          기미, 잡티, 색소 침착<br><br>
+          <span style="color:var(--cyan);font-family:'Space Mono',monospace;font-size:var(--small-size);">VISIA → Brown map</span>
+        </div>
+      </div>
+      <div class="card magenta" style="display:flex;flex-direction:column;gap:0.5em;">
+        <div class="card-icon">🔴</div>
+        <div class="card-title">Hemoglobin</div>
+        <div class="card-body">
+          붉은 혈색소<br>
+          홍조, 모세혈관, 염증<br><br>
+          <span style="color:var(--magenta);font-family:'Space Mono',monospace;font-size:var(--small-size);">VISIA → Red map</span>
+        </div>
+      </div>
+      <div class="card gold" style="display:flex;flex-direction:column;gap:0.5em;">
+        <div class="card-icon">〰️</div>
+        <div class="card-title">Wrinkle</div>
+        <div class="card-body">
+          주름, 피부 질감<br>
+          노화 지표, 음영 패턴<br><br>
+          <span style="color:var(--gold);font-family:'Space Mono',monospace;font-size:var(--small-size);">VISIA → Wrinkle map</span>
+        </div>
+      </div>
+    </div>
+    <div class="reveal reveal-d2" style="margin-top:var(--gap);">
+      <div class="formula">
+        입력: <span class="cyn">RGB</span> (외부 조명 하) &nbsp;→&nbsp;
+        출력: <span class="cyn">Brown</span> + <span class="mag">Red</span> + <span class="gld">Wrinkle</span> (VISIA 수준)
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">03 / 12</div>
+</section>
+
+<!-- ============================================================
+     SLIDE 04: BEER-LAMBERT
+     ============================================================ -->
+<section class="slide" id="s4">
+  <div class="glow-orb" style="width:400px;height:400px;top:-10%;right:-5%;background:var(--cyan);opacity:0.15;"></div>
+  <div class="slide-inner">
+    <h2 class="slide-title reveal"><span class="num">04 —</span>배경: Beer-Lambert 법칙</h2>
+    <div class="reveal reveal-d1" style="display:flex;flex-direction:column;gap:var(--gap);flex:1;justify-content:center;">
+      <div class="formula" style="font-size:clamp(0.85rem,1.8vw,1.2rem);">
+        <span class="cyn">RGB</span> = <span class="mag">illuminant</span> × exp(−<span class="gld">OD</span>)
+      </div>
+      <div class="formula">
+        log(<span class="cyn">RGB</span>) = log(<span class="mag">illuminant</span>) − <span class="gld">OD</span>
+      </div>
+      <ul class="bullet-list" style="margin-top:0.4rem;">
+        <li><span class="hl">log 도메인</span>에서 조명은 <span class="hl">additive offset</span></li>
+        <li><span class="hlg">OD = −log(RGB)</span>: 조명 변화 → 전체적 평행이동만 발생</li>
+        <li>채널 비율 <span class="hl">log(R/G), log(G/B)</span>: 중성 조명 가정 시 <span class="hl">조명 독립</span></li>
+        <li>InstanceNorm / channel norm → <span class="hl">조명 offset 제거</span> 가능</li>
+      </ul>
+      <div class="formula" style="margin-top:0.4rem;">
+        <span class="cm"># ODPreprocess: RGB → [OD × 3ch, log(R/G), log(G/B)] → 1×1 Conv → 3ch</span>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">04 / 12</div>
+</section>
+
+<!-- ============================================================
+     SLIDE 05: FREQUENCY DOMAIN
+     ============================================================ -->
+<section class="slide" id="s5">
+  <div class="glow-orb" style="width:350px;height:350px;bottom:-5%;left:-5%;background:var(--magenta);opacity:0.18;"></div>
+  <div class="slide-inner">
+    <h2 class="slide-title reveal"><span class="num">05 —</span>배경: 주파수 도메인과 조명</h2>
+    <div class="card-grid cols-3 reveal reveal-d1" style="margin-bottom:var(--gap);max-height:52vh;">
+      <div class="card" style="text-align:center;padding:clamp(0.8rem,1.5vw,1.2rem);">
+        <div style="font-size:clamp(1.6rem,3vw,2.4rem);margin-bottom:0.3em;">🌅</div>
+        <div class="card-title" style="font-size:var(--body-size);">Low Freq</div>
+        <div class="card-body">완만한 공간 변화<br><strong style="color:var(--cyan);">조명 (Illumination)</strong></div>
+      </div>
+      <div class="card magenta" style="text-align:center;padding:clamp(0.8rem,1.5vw,1.2rem);">
+        <div style="font-size:clamp(1.6rem,3vw,2.4rem);margin-bottom:0.3em;">🧬</div>
+        <div class="card-title" style="font-size:var(--body-size);">Mid Freq</div>
+        <div class="card-body">색소 분포 패턴<br><strong style="color:var(--magenta);">Melanin / Hemoglobin</strong></div>
+      </div>
+      <div class="card gold" style="text-align:center;padding:clamp(0.8rem,1.5vw,1.2rem);">
+        <div style="font-size:clamp(1.6rem,3vw,2.4rem);margin-bottom:0.3em;">〰️</div>
+        <div class="card-title" style="font-size:var(--body-size);">High Freq</div>
+        <div class="card-body">미세 경계, 음영<br><strong style="color:var(--gold);">Wrinkle / Texture</strong></div>
+      </div>
+    </div>
+    <div class="reveal reveal-d2">
+      <div class="formula">
+        <span class="cm"># Retinex 이론과 일치: log(RGB) = log(illuminant) + log(reflectance)</span><br>
+        log(<span class="mag">illuminant</span>) → <span class="cyn">저주파 성분</span> &nbsp;|&nbsp; log(<span class="gld">reflectance</span>) → <span class="cyn">중/고주파 성분</span>
+      </div>
+    </div>
+    <div class="reveal reveal-d3" style="margin-top:var(--gap);">
+      <ul class="bullet-list">
+        <li><span class="hl">주파수 분리 = 조명 분리</span> — Beer-Lambert + Retinex 이론으로 뒷받침</li>
+        <li>Skip connection에서 FFT → <span class="hl">대역별 분리</span> → iFFT: 네트워크 내부에서 동적 수행</li>
+      </ul>
+    </div>
+  </div>
+  <div class="slide-num">05 / 12</div>
+</section>
+
+<!-- ============================================================
+     SLIDE 06: CORE IDEA
+     ============================================================ -->
+<section class="slide" id="s6">
+  <div class="glow-orb" style="width:450px;height:450px;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--cyan);opacity:0.08;"></div>
+  <div class="slide-inner">
+    <h2 class="slide-title reveal"><span class="num">06 —</span>핵심 아이디어</h2>
+    <div class="reveal reveal-d1" style="flex:1;display:flex;flex-direction:column;justify-content:center;gap:var(--gap);">
+      <div class="formula" style="font-size:clamp(0.9rem,1.8vw,1.15rem);text-align:center;padding:1em 1.5em;border-left:none;border:1px solid var(--border);border-radius:4px;box-shadow:0 0 20px var(--glow-c);">
+        U-Net <span class="cyn">Skip Connection</span> 에서 <span class="mag">FFT</span> 적용
+      </div>
+      <div class="arch">
+        <div class="arch-row">
+          <div class="arch-box">Encoder feature</div>
+          <div class="arch-arr">→</div>
+          <div class="arch-box key">FFT2D + fftshift</div>
+          <div class="arch-arr">→</div>
+          <div class="arch-box key">주파수 대역 분리</div>
+        </div>
+        <div class="arch-arr">↓</div>
+        <div class="arch-row">
+          <div class="arch-branch">
+            <div style="display:flex;flex-direction:column;align-items:center;gap:0.3em;">
+              <div class="arch-box" style="font-size:var(--small-size);">Low gate (학습)</div>
+              <div style="font-size:var(--small-size);color:var(--magenta);">조명 억제</div>
+            </div>
+            <div class="arch-arr">+</div>
+            <div style="display:flex;flex-direction:column;align-items:center;gap:0.3em;">
+              <div class="arch-box" style="font-size:var(--small-size);">Mid gate (학습)</div>
+              <div style="font-size:var(--small-size);color:var(--cyan);">chromophore 보존</div>
+            </div>
+            <div class="arch-arr">+</div>
+            <div style="display:flex;flex-direction:column;align-items:center;gap:0.3em;">
+              <div class="arch-box" style="font-size:var(--small-size);">High gate (학습)</div>
+              <div style="font-size:var(--small-size);color:var(--gold);">주름 보존</div>
+            </div>
+          </div>
+        </div>
+        <div class="arch-arr">↓ iFFT</div>
+        <div class="arch-row">
+          <div class="arch-box">x_chroma</div>
+          <div class="arch-arr">→</div>
+          <div class="arch-box mag">Brown / Red Decoder</div>
+          <div class="arch-arr" style="margin-left:1em;"></div>
+          <div class="arch-box gold">x_texture → Wrinkle Head</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">06 / 12</div>
+</section>
+
+<!-- ============================================================
+     SLIDE 07: ARCHITECTURE
+     ============================================================ -->
+<section class="slide" id="s7">
+  <div class="glow-orb" style="width:300px;height:300px;top:0;right:0;background:var(--cyan);opacity:0.1;"></div>
+  <div class="slide-inner">
+    <h2 class="slide-title reveal"><span class="num">07 —</span>전체 아키텍처</h2>
+    <div class="reveal reveal-d1" style="flex:1;display:flex;flex-direction:column;justify-content:center;gap:clamp(0.4rem,1vh,0.8rem);">
+      <div class="arch" style="gap:clamp(0.3rem,0.7vh,0.6rem);">
+        <!-- Input -->
+        <div class="arch-row">
+          <div class="arch-box">RGB Input [B,3,H,W]</div>
+          <div class="arch-arr">→</div>
+          <div class="arch-box key">ODPreprocess</div>
+          <div class="arch-arr">→</div>
+          <div class="arch-box">OD + ratio [B,3,H,W]</div>
+        </div>
+        <div class="arch-arr">↓</div>
+        <!-- Encoder -->
+        <div class="arch-row">
+          <div class="arch-box">Enc1 [B,64,H,W]</div>
+          <div class="arch-arr">→</div>
+          <div class="arch-box">Enc2 [B,128,H/2]</div>
+          <div class="arch-arr">→</div>
+          <div class="arch-box">Enc3 [B,256,H/4]</div>
+          <div class="arch-arr">→</div>
+          <div class="arch-box">Enc4 [B,512,H/8]</div>
+        </div>
+        <div class="arch-arr">↓ (각 레벨에서)</div>
+        <!-- FreqGate -->
+        <div class="arch-row">
+          <div class="arch-box key" style="font-size:clamp(0.7rem,1.2vw,0.9rem);padding:0.4em 1.2em;">FrequencyGate × 3</div>
+          <div class="arch-arr">→</div>
+          <div style="display:flex;gap:0.5em;flex-wrap:wrap;justify-content:center;">
+            <div class="arch-box" style="font-size:var(--small-size);">s1/s2/s3_chroma</div>
+            <span style="color:var(--muted);align-self:center;">+</span>
+            <div class="arch-box gold" style="font-size:var(--small-size);">s1/s2/s3_texture</div>
+          </div>
+        </div>
+        <div class="arch-arr">↓</div>
+        <!-- Decoder + Heads -->
+        <div class="arch-row">
+          <div style="display:flex;flex-direction:column;align-items:center;gap:0.3em;">
+            <div class="arch-box" style="font-size:var(--small-size);">Chromophore Decoder</div>
+            <div class="arch-row" style="gap:0.4em;">
+              <div class="arch-box" style="font-size:var(--small-size);">Brown Head</div>
+              <div class="arch-box mag" style="font-size:var(--small-size);">Red Head</div>
+            </div>
+          </div>
+          <div class="arch-arr" style="margin:0 0.8em;">|</div>
+          <div style="display:flex;flex-direction:column;align-items:center;gap:0.3em;">
+            <div class="arch-box gold" style="font-size:var(--small-size);">High-freq Concat</div>
+            <div class="arch-box gold" style="font-size:var(--small-size);">Wrinkle Head</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">07 / 12</div>
+</section>
+
+<!-- ============================================================
+     SLIDE 08: FREQUENCYGATE CODE
+     ============================================================ -->
+<section class="slide" id="s8">
+  <div class="glow-orb" style="width:300px;height:300px;bottom:0;right:0;background:var(--cyan);opacity:0.12;"></div>
+  <div class="slide-inner">
+    <h2 class="slide-title reveal"><span class="num">08 —</span>FrequencyGate — 핵심 모듈</h2>
+    <div class="reveal reveal-d1" style="flex:1;display:flex;flex-direction:column;gap:var(--gap);justify-content:center;">
+      <div class="code-block">
+<span class="cm"># 1. FFT + 저주파 중앙 정렬</span>
+X_f = torch.<span class="fn">fft</span>.fft2(x, norm=<span class="st">'ortho'</span>)
+X_f = torch.<span class="fn">fft</span>.fftshift(X_f, dim=(<span class="nm">-2</span>, <span class="nm">-1</span>))
+
+<span class="cm"># 2. 반경 기반 마스크: r = dist / (min(H,W)/2)</span>
+low_m  = (r &lt;  <span class="nm">0.1</span>).float()   <span class="cm"># 조명 억제 대역</span>
+mid_m  = (r 사이 <span class="nm">0.1~0.4</span>).float() <span class="cm"># chromophore</span>
+high_m = (r &gt;= <span class="nm">0.4</span>).float()  <span class="cm"># wrinkle/texture</span>
+
+<span class="cm"># 3. Learnable gates (초기값 물리 기반)</span>
+g_low  = torch.<span class="fn">sigmoid</span>(self.low_logit)   <span class="cm"># init≈0.12 (억제)</span>
+g_mid  = torch.<span class="fn">sigmoid</span>(self.mid_logit)   <span class="cm"># init≈0.88 (보존)</span>
+
+<span class="cm"># 4. 가중치 적용 + iFFT</span>
+X_chroma  = X_f * (low_m * g_low + mid_m * g_mid)
+x_chroma  = <span class="fn">ifft2</span>(<span class="fn">ifftshift</span>(X_chroma)).real</div>
+      <ul class="bullet-list reveal reveal-d2" style="font-size:var(--small-size);">
+        <li><span class="hl">low_logit 초기값 −2</span>: sigmoid ≈ 0.12 → 조명 대역 처음부터 억제</li>
+        <li><span class="hl">학습으로 최적 대역</span> 자동 발견 — 고정 필터가 아님</li>
+        <li>low_gate 값이 학습 중 <span class="hl">0에 가까워질수록</span> 조명 분리 성공</li>
+      </ul>
+    </div>
+  </div>
+  <div class="slide-num">08 / 12</div>
+</section>
+
+<!-- ============================================================
+     SLIDE 09: OD PREPROCESS
+     ============================================================ -->
+<section class="slide" id="s9">
+  <div class="glow-orb" style="width:350px;height:350px;top:-10%;left:-5%;background:var(--gold);opacity:0.1;"></div>
+  <div class="slide-inner">
+    <h2 class="slide-title reveal"><span class="num">09 —</span>ODPreprocess — 물리 기반 입력 변환</h2>
+    <div class="reveal reveal-d1" style="flex:1;display:flex;flex-direction:column;gap:var(--gap);justify-content:center;">
+      <div class="card-grid cols-2" style="max-height:45vh;">
+        <div class="card" style="display:flex;flex-direction:column;gap:0.5em;">
+          <div class="card-title">Optical Density (OD)</div>
+          <div class="formula" style="font-size:var(--mono-size);">
+            <span class="gld">OD</span> = −log(<span class="cyn">RGB</span> + ε)
+          </div>
+          <div class="card-body">Beer-Lambert 기반<br>조명이 additive offset → 정규화로 제거 가능</div>
+        </div>
+        <div class="card gold" style="display:flex;flex-direction:column;gap:0.5em;">
+          <div class="card-title">Channel Log-Ratio</div>
+          <div class="formula" style="font-size:var(--mono-size);">
+            log(R/G), log(G/B)
+          </div>
+          <div class="card-body">중성 조명 가정 시<br><strong style="color:var(--gold);">조명에 완전 독립적</strong>인 표현</div>
+        </div>
+      </div>
+      <div class="arch reveal reveal-d2" style="gap:0.5em;">
+        <div class="arch-row">
+          <div class="arch-box">[OD×3, log(R/G), log(G/B)]</div>
+          <div class="arch-arr">→</div>
+          <div class="arch-box key">Conv 5→3 (1×1)</div>
+          <div class="arch-arr">→</div>
+          <div class="arch-box">[B, 3, H, W]</div>
+        </div>
+      </div>
+      <ul class="bullet-list reveal reveal-d3">
+        <li>5ch → 3ch: <span class="hl">학습 가능한 압축</span> — 최적 표현 자동 발견</li>
+        <li>초기값: OD 채널 그대로 통과 (identity init) → <span class="hl">안정적 수렴</span></li>
+        <li>FrequencyGate와 상호보완: <span class="hl">입력 + feature 두 단계에서 조명 제거</span></li>
+      </ul>
+    </div>
+  </div>
+  <div class="slide-num">09 / 12</div>
+</section>
+
+<!-- ============================================================
+     SLIDE 10: LOSS STRATEGY
+     ============================================================ -->
+<section class="slide" id="s10">
+  <div class="glow-orb" style="width:300px;height:300px;bottom:5%;right:5%;background:var(--magenta);opacity:0.15;"></div>
+  <div class="slide-inner">
+    <h2 class="slide-title reveal"><span class="num">10 —</span>Loss 전략 — 3단계 학습</h2>
+    <div class="reveal reveal-d1" style="flex:1;display:flex;flex-direction:column;gap:var(--gap);justify-content:center;">
+      <table class="phase-table">
+        <thead>
+          <tr>
+            <th>Phase</th><th>Epoch</th><th>활성 Loss</th><th>목적</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="p1">Phase 1</td>
+            <td>0 ~ 40%</td>
+            <td><span class="p1">L1(brown, red, wrinkle)</span> + Beer-Lambert Recon</td>
+            <td>빠른 수렴, 기본 분리 학습</td>
+          </tr>
+          <tr>
+            <td class="p2">Phase 2</td>
+            <td>40 ~ 80%</td>
+            <td>+ <span class="p2">Illumination Consistency</span></td>
+            <td>조명 augment 이미지와 동일 출력 강제</td>
+          </tr>
+          <tr>
+            <td class="p3">Phase 3</td>
+            <td>80 ~ 100%</td>
+            <td>+ <span class="p3">FreqGate Regularization</span></td>
+            <td>low_gate → 0 유도, 조명 억제 강화</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="formula reveal reveal-d2">
+        <span class="cm"># Illumination Augmentation: 밝기 × 0.5~1.8, 색온도 × 0.7~1.3</span><br>
+        <span class="cm">#                           틴트 편향, 공간 Vignetting (30% 확률)</span><br>
+        loss_consist = L1(<span class="cyn">brown_orig</span>, <span class="cyn">brown_aug</span>) + L1(<span class="mag">red_orig</span>, <span class="mag">red_aug</span>) + ...
+      </div>
+      <ul class="bullet-list reveal reveal-d3">
+        <li>Beer-Lambert Recon: <span class="hlg">OD → RGB 복원</span>으로 물리 제약 부여 (w=0.3)</li>
+        <li>FreqReg: <span class="hl">sigmoid(low_logit).mean()</span> → 0 유도로 조명 대역 억제 보장</li>
+      </ul>
+    </div>
+  </div>
+  <div class="slide-num">10 / 12</div>
+</section>
+
+<!-- ============================================================
+     SLIDE 11: NOVELTY
+     ============================================================ -->
+<section class="slide" id="s11">
+  <div class="glow-orb" style="width:400px;height:400px;top:20%;left:-10%;background:var(--cyan);opacity:0.1;"></div>
+  <div class="slide-inner">
+    <h2 class="slide-title reveal"><span class="num">11 —</span>기존 연구 대비 차별점</h2>
+    <div class="card-grid cols-2 reveal reveal-d1" style="flex:1;max-height:72vh;">
+      <div class="card" style="display:flex;flex-direction:column;gap:0.5em;">
+        <div class="card-title">vs DINOv2 기반</div>
+        <ul class="bullet-list" style="font-size:var(--small-size);">
+          <li>DINOv2: 대형 ViT, 86M+ 파라미터</li>
+          <li>FreqAwareUNet: <span class="hl">경량, 도메인 특화</span></li>
+          <li>물리 기반 설명 가능 (Explainable)</li>
+          <li>주름 분석: High-freq 자연스러운 분리</li>
+        </ul>
+      </div>
+      <div class="card magenta" style="display:flex;flex-direction:column;gap:0.5em;">
+        <div class="card-title">vs 기존 Retinex</div>
+        <ul class="bullet-list" style="font-size:var(--small-size);">
+          <li>Retinex: <span class="hlm">전처리로만 적용</span> (정적)</li>
+          <li>FreqGate: <span class="hlm">네트워크 내부</span>에서 동적 분리</li>
+          <li>대역 경계를 <span class="hlm">데이터에서 자동 학습</span></li>
+          <li>Task별 최적 주파수 자동 발견</li>
+        </ul>
+      </div>
+      <div class="card gold" style="display:flex;flex-direction:column;gap:0.5em;">
+        <div class="card-title">vs 일반 U-Net</div>
+        <ul class="bullet-list" style="font-size:var(--small-size);">
+          <li>일반: 조명 정보 그대로 skip</li>
+          <li>FreqAware: <span class="hlg">주파수 대역별 task 라우팅</span></li>
+          <li>주름: high-freq만 사용 → 조명 음영과 분리</li>
+          <li>단일 모델로 3가지 task 동시 처리</li>
+        </ul>
+      </div>
+      <div class="card" style="display:flex;flex-direction:column;gap:0.5em;border-color:rgba(0,212,255,0.5);box-shadow:0 0 15px var(--glow-c);">
+        <div class="card-title">3중 이론 융합</div>
+        <ul class="bullet-list" style="font-size:var(--small-size);">
+          <li><span class="hl">Beer-Lambert</span>: OD 도메인 변환</li>
+          <li><span class="hl">Retinex</span>: 조명 = 저주파</li>
+          <li><span class="hl">Deep Learning</span>: 최적 대역 학습</li>
+          <li>→ 논문 기여로 출판 가능한 조합</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">11 / 12</div>
+</section>
+
+<!-- ============================================================
+     SLIDE 12: CONCLUSION
+     ============================================================ -->
+<section class="slide" id="s12">
+  <div class="glow-orb" style="width:500px;height:500px;top:-20%;right:-10%;background:var(--cyan);opacity:0.12;"></div>
+  <div class="glow-orb" style="width:400px;height:400px;bottom:-15%;left:-5%;background:var(--magenta);opacity:0.12;"></div>
+  <div class="slide-inner" style="justify-content:center;gap:var(--gap);">
+    <div class="reveal">
+      <span class="tag">SUMMARY</span>
+    </div>
+    <h2 class="slide-title reveal reveal-d1" style="margin-top:0.5em;">결론 및 향후 계획</h2>
+    <ul class="bullet-list reveal reveal-d2" style="max-width:700px;">
+      <li><span class="hl">FrequencyGate</span>: Skip connection에서 FFT 기반 주파수 대역 분리 — <span class="hl">논문 첫 시도</span></li>
+      <li><span class="hl">ODPreprocess</span>: Beer-Lambert 물리 법칙 기반 조명 불변 입력 변환</li>
+      <li><span class="hl">Multi-task</span>: Brown, Red, Wrinkle 동시 예측 — 단일 순방향 패스</li>
+      <li><span class="hl">3단계 학습</span>: Supervised → Consistency → FreqReg 순차 활성화</li>
+    </ul>
+    <div class="reveal reveal-d3" style="margin-top:0.8em;">
+      <div class="formula">
+        <span class="cm"># 향후 계획</span><br>
+        1. 실제 VISIA 데이터로 검증 및 성능 측정<br>
+        2. FrequencyGate 시각화 분석 (어떤 대역이 학습되는지)<br>
+        3. 논문 작성 (CVPR / MICCAI 타겟)
+      </div>
+    </div>
+    <div class="reveal reveal-d4" style="margin-top:0.8em;display:flex;gap:0.8em;flex-wrap:wrap;">
+      <span class="tag">🔗 github.com/jeromeyoon/Freq-skin-unet</span>
+      <span class="tag">📦 model.py · loss.py · train.py</span>
+    </div>
+  </div>
+  <div class="slide-num">12 / 12</div>
+</section>
+
+<!-- ============================================================
+     NAVIGATION
+     ============================================================ -->
+<nav class="nav-dots" aria-label="슬라이드 탐색">
+  <button class="nav-dot active" data-idx="0" aria-label="슬라이드 1"></button>
+  <button class="nav-dot" data-idx="1" aria-label="슬라이드 2"></button>
+  <button class="nav-dot" data-idx="2" aria-label="슬라이드 3"></button>
+  <button class="nav-dot" data-idx="3" aria-label="슬라이드 4"></button>
+  <button class="nav-dot" data-idx="4" aria-label="슬라이드 5"></button>
+  <button class="nav-dot" data-idx="5" aria-label="슬라이드 6"></button>
+  <button class="nav-dot" data-idx="6" aria-label="슬라이드 7"></button>
+  <button class="nav-dot" data-idx="7" aria-label="슬라이드 8"></button>
+  <button class="nav-dot" data-idx="8" aria-label="슬라이드 9"></button>
+  <button class="nav-dot" data-idx="9" aria-label="슬라이드 10"></button>
+  <button class="nav-dot" data-idx="10" aria-label="슬라이드 11"></button>
+  <button class="nav-dot" data-idx="11" aria-label="슬라이드 12"></button>
+</nav>
+
+<div class="kbd-hint">↑ ↓ · SPACE · SWIPE</div>
+
+<script>
+/* ============================================================
+   Presentation Controller
+   ============================================================ */
+(function () {
+  const slides = Array.from(document.querySelectorAll('.slide'));
+  const dots   = Array.from(document.querySelectorAll('.nav-dot'));
+  let current  = 0;
+  let isScrolling = false;
+
+  /* --- Reveal animation via IntersectionObserver --- */
+  const revealObs = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        e.target.querySelectorAll('.reveal').forEach(el => el.classList.add('in'));
+      }
+    });
+  }, { threshold: 0.4 });
+  slides.forEach(s => revealObs.observe(s));
+
+  /* --- Slide index tracking --- */
+  const scrollObs = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting && e.intersectionRatio > 0.5) {
+        const idx = slides.indexOf(e.target);
+        if (idx !== -1) {
+          current = idx;
+          dots.forEach((d, i) => d.classList.toggle('active', i === idx));
+        }
+      }
+    });
+  }, { threshold: 0.5 });
+  slides.forEach(s => scrollObs.observe(s));
+
+  /* --- Navigate --- */
+  function goTo(idx) {
+    idx = Math.max(0, Math.min(slides.length - 1, idx));
+    slides[idx].scrollIntoView({ behavior: 'smooth' });
+    current = idx;
+  }
+
+  /* --- Keyboard --- */
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowRight' || e.key === ' ') {
+      e.preventDefault(); goTo(current + 1);
+    } else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+      e.preventDefault(); goTo(current - 1);
+    }
+  });
+
+  /* --- Dots --- */
+  dots.forEach((d, i) => {
+    d.addEventListener('click', () => goTo(i));
+  });
+
+  /* --- Wheel (debounced) --- */
+  document.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    if (isScrolling) return;
+    isScrolling = true;
+    goTo(e.deltaY > 0 ? current + 1 : current - 1);
+    setTimeout(() => { isScrolling = false; }, 900);
+  }, { passive: false });
+
+  /* --- Touch --- */
+  let touchY = 0;
+  document.addEventListener('touchstart', (e) => { touchY = e.touches[0].clientY; }, { passive: true });
+  document.addEventListener('touchend', (e) => {
+    const dy = touchY - e.changedTouches[0].clientY;
+    if (Math.abs(dy) > 50) goTo(dy > 0 ? current + 1 : current - 1);
+  }, { passive: true });
+
+  /* --- Init first slide reveal --- */
+  slides[0].querySelectorAll('.reveal').forEach(el => el.classList.add('in'));
+})();
+</script>
+</body>
+</html>
