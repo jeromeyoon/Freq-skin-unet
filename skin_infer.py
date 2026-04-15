@@ -9,6 +9,7 @@ SkinAnalyzer 추론 스크립트
   2. 디렉토리 일괄 추론 (배치 처리)
   3. 결과 시각화 저장 (입력 | brown | red | wrinkle 가로 나열)
   4. 스코어 JSON 출력
+  5. GT 마스크가 있을 때 Dice score 계산 → 텍스트 파일 저장
 
 실행 예시
 ---------
@@ -19,7 +20,18 @@ SkinAnalyzer 추론 스크립트
       --checkpoint ./checkpoints/best_skin_analyzer.pth \
       --out_dir ./results
 
+  # 단일 + GT Dice 계산
+  python skin_infer.py \
+      --cross  ./samples/cross.png \
+      --parallel ./samples/parallel.png \
+      --gt_brown   ./gt/brown.png \
+      --gt_red     ./gt/red.png \
+      --gt_wrinkle ./gt/wrinkle.png \
+      --checkpoint ./checkpoints/best_skin_analyzer.pth \
+      --out_dir ./results
+
   # 디렉토리 일괄 추론 (rgb_cross / rgb_parallel 폴더 구조 가정)
+  # GT가 있으면 gt_brown/, gt_red/, gt_wrinkle/ 폴더도 함께 배치
   python skin_infer.py \
       --input_dir ./patches \
       --checkpoint ./checkpoints/best_skin_analyzer.pth \
@@ -64,6 +76,27 @@ def load_gray(path: Path, img_size: int) -> torch.Tensor:
     img = Image.open(path).convert('L').resize(
         (img_size, img_size), Image.BILINEAR)
     return TF.to_tensor(img)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Dice Score 계산
+# ══════════════════════════════════════════════════════════════════════════════
+def compute_dice(pred_prob: torch.Tensor,
+                 gt_prob:   torch.Tensor,
+                 threshold: float = 0.5,
+                 smooth:    float = 1.0) -> float:
+    """
+    Binary Dice coefficient (평가용).
+
+    pred_prob : [1, H, W]  sigmoid 적용된 확률맵 (0~1)
+    gt_prob   : [1, H, W]  GT 확률맵 (0~1, threshold 기준 이진화)
+    → 두 맵을 threshold로 이진화 후 Dice coefficient 반환
+    """
+    pred_bin = (pred_prob >= threshold).float()
+    gt_bin   = (gt_prob   >= threshold).float()
+    inter    = (pred_bin * gt_bin).sum()
+    dice     = (2.0 * inter + smooth) / (pred_bin.sum() + gt_bin.sum() + smooth)
+    return dice.item()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -180,6 +213,9 @@ class InferDataset(torch.utils.data.Dataset):
       rgb_cross/    {stem}.png
       rgb_parallel/ {stem}.png
       mask/         {stem}.png  (optional)
+      gt_brown/     {stem}.png  (optional) — GT 갈색 반점 마스크
+      gt_red/       {stem}.png  (optional) — GT 적색 반점 마스크
+      gt_wrinkle/   {stem}.png  (optional) — GT 주름 마스크
     """
 
     def __init__(self, input_dir: Path, img_size: int):
@@ -197,7 +233,19 @@ class InferDataset(torch.utils.data.Dataset):
         if not self.stems:
             raise RuntimeError(f"rgb_cross 폴더에 .png 파일이 없습니다: {cross_dir}")
 
+        # GT 폴더 존재 여부 확인
+        self.has_gt_brown   = (input_dir / 'gt_brown').exists()
+        self.has_gt_red     = (input_dir / 'gt_red').exists()
+        self.has_gt_wrinkle = (input_dir / 'gt_wrinkle').exists()
+
+        gt_info = []
+        if self.has_gt_brown:   gt_info.append('gt_brown')
+        if self.has_gt_red:     gt_info.append('gt_red')
+        if self.has_gt_wrinkle: gt_info.append('gt_wrinkle')
+
         print(f"추론 대상: {len(self.stems)}장")
+        if gt_info:
+            print(f"GT 폴더 감지: {', '.join(gt_info)} → Dice score 계산 활성화")
 
     def __len__(self):
         return len(self.stems)
@@ -216,20 +264,38 @@ class InferDataset(torch.utils.data.Dataset):
         else:
             mask = torch.ones(1, self.img_size, self.img_size)
 
-        return {
+        item = {
             'rgb_cross'   : rgb_cross,
             'rgb_parallel': rgb_parallel,
             'mask'        : mask,
             'stem'        : stem,
         }
 
+        # GT 로드 (없으면 zeros 텐서 + has_gt=False)
+        for tag in ('brown', 'red', 'wrinkle'):
+            gt_path = self.input_dir / f'gt_{tag}' / f'{stem}.png'
+            if gt_path.exists():
+                item[f'gt_{tag}']      = load_gray(gt_path, self.img_size)
+                item[f'has_gt_{tag}']  = True
+            else:
+                item[f'gt_{tag}']      = torch.zeros(1, self.img_size, self.img_size)
+                item[f'has_gt_{tag}']  = False
+
+        return item
+
 
 def _infer_collate(batch: list) -> dict:
     return {
-        'rgb_cross'   : torch.stack([b['rgb_cross']    for b in batch]),
-        'rgb_parallel': torch.stack([b['rgb_parallel'] for b in batch]),
-        'mask'        : torch.stack([b['mask']         for b in batch]),
-        'stem'        : [b['stem'] for b in batch],
+        'rgb_cross'    : torch.stack([b['rgb_cross']    for b in batch]),
+        'rgb_parallel' : torch.stack([b['rgb_parallel'] for b in batch]),
+        'mask'         : torch.stack([b['mask']         for b in batch]),
+        'stem'         : [b['stem'] for b in batch],
+        'gt_brown'     : torch.stack([b['gt_brown']     for b in batch]),
+        'gt_red'       : torch.stack([b['gt_red']       for b in batch]),
+        'gt_wrinkle'   : torch.stack([b['gt_wrinkle']   for b in batch]),
+        'has_gt_brown'   : [b['has_gt_brown']   for b in batch],
+        'has_gt_red'     : [b['has_gt_red']     for b in batch],
+        'has_gt_wrinkle' : [b['has_gt_wrinkle'] for b in batch],
     }
 
 
@@ -248,7 +314,9 @@ def infer_directory(
 
     Returns
     -------
-    list of dicts: [{'stem', 'brown_score', 'red_score', 'wrinkle_score'}, ...]
+    list of dicts: [{'stem', 'brown_score', 'red_score', 'wrinkle_score',
+                     'brown_dice', 'red_dice', 'wrinkle_dice'}, ...]
+    GT가 없는 task의 dice 값은 None.
     """
     ds = InferDataset(input_dir, img_size)
     loader = torch.utils.data.DataLoader(
@@ -276,6 +344,13 @@ def infer_directory(
         mask         = batch['mask'].to(device)
         stems        = batch['stem']
 
+        gt_brown   = batch['gt_brown']    # CPU 텐서 [B,1,H,W]
+        gt_red     = batch['gt_red']
+        gt_wrinkle = batch['gt_wrinkle']
+        has_gt_brown   = batch['has_gt_brown']
+        has_gt_red     = batch['has_gt_red']
+        has_gt_wrinkle = batch['has_gt_wrinkle']
+
         result = model(rgb_cross, rgb_parallel, mask)
 
         for i, stem in enumerate(stems):
@@ -286,6 +361,14 @@ def infer_directory(
             b_score = result.brown_score[i].item()
             r_score = result.red_score[i].item()
             w_score = result.wrinkle_score[i].item()
+
+            # Dice score 계산 (GT 있는 task만)
+            b_dice = (compute_dice(brown_prob,   gt_brown[i])
+                      if has_gt_brown[i]   else None)
+            r_dice = (compute_dice(red_prob,     gt_red[i])
+                      if has_gt_red[i]     else None)
+            w_dice = (compute_dice(wrinkle_prob, gt_wrinkle[i])
+                      if has_gt_wrinkle[i] else None)
 
             # 시각화 저장
             save_visualization(
@@ -306,9 +389,12 @@ def infer_directory(
 
             all_scores.append({
                 'stem'         : stem,
-                'brown_score'  : round(b_score, 2),
-                'red_score'    : round(r_score, 2),
-                'wrinkle_score': round(w_score, 2),
+                'brown_score'  : round(b_score, 4),
+                'red_score'    : round(r_score, 4),
+                'wrinkle_score': round(w_score, 4),
+                'brown_dice'   : round(b_dice, 4) if b_dice is not None else None,
+                'red_dice'     : round(r_dice, 4) if r_dice is not None else None,
+                'wrinkle_dice' : round(w_dice, 4) if w_dice is not None else None,
             })
 
         pbar.set_postfix(
@@ -318,6 +404,39 @@ def infer_directory(
         )
 
     return all_scores
+
+
+def _save_dice_txt_batch(all_scores: list[dict], save_path: Path) -> None:
+    """배치 추론 결과의 Dice score를 텍스트 파일로 저장."""
+    col_w = max((len(s['stem']) for s in all_scores), default=10) + 2
+
+    lines = [
+        '# Dice Scores (binary Dice coefficient, threshold=0.5)',
+        f"# {'stem':<{col_w}}  {'brown_dice':>12}  {'red_dice':>12}  {'wrinkle_dice':>12}",
+        '#' + '-' * (col_w + 44),
+    ]
+
+    for s in all_scores:
+        b = f"{s['brown_dice']:.4f}"   if s['brown_dice']   is not None else 'N/A'
+        r = f"{s['red_dice']:.4f}"     if s['red_dice']     is not None else 'N/A'
+        w = f"{s['wrinkle_dice']:.4f}" if s['wrinkle_dice'] is not None else 'N/A'
+        lines.append(f"  {s['stem']:<{col_w}}  {b:>12}  {r:>12}  {w:>12}")
+
+    # 평균 (GT 있는 샘플만)
+    b_vals = [s['brown_dice']   for s in all_scores if s['brown_dice']   is not None]
+    r_vals = [s['red_dice']     for s in all_scores if s['red_dice']     is not None]
+    w_vals = [s['wrinkle_dice'] for s in all_scores if s['wrinkle_dice'] is not None]
+
+    lines += [
+        '#' + '-' * (col_w + 44),
+        f"# 평균 (GT 있는 샘플만)",
+        f"#   mean_brown_dice   : {sum(b_vals)/len(b_vals):.4f}  (n={len(b_vals)})" if b_vals else "#   mean_brown_dice   : N/A",
+        f"#   mean_red_dice     : {sum(r_vals)/len(r_vals):.4f}  (n={len(r_vals)})" if r_vals else "#   mean_red_dice     : N/A",
+        f"#   mean_wrinkle_dice : {sum(w_vals)/len(w_vals):.4f}  (n={len(w_vals)})" if w_vals else "#   mean_wrinkle_dice : N/A",
+    ]
+
+    with open(save_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -349,11 +468,18 @@ def parse_args() -> argparse.Namespace:
                         help='평행 편광 이미지 경로')
     single.add_argument('--mask',     type=str, default=None,
                         help='피부 영역 마스크 경로 (optional)')
+    single.add_argument('--gt_brown',   type=str, default=None,
+                        help='GT 갈색 반점 마스크 경로 (optional, Dice 계산용)')
+    single.add_argument('--gt_red',     type=str, default=None,
+                        help='GT 적색 반점 마스크 경로 (optional, Dice 계산용)')
+    single.add_argument('--gt_wrinkle', type=str, default=None,
+                        help='GT 주름 마스크 경로 (optional, Dice 계산용)')
 
     # 디렉토리 일괄 추론 모드
     batch = parser.add_argument_group('디렉토리 일괄 추론 모드')
     batch.add_argument('--input_dir',   type=str, default=None,
-                       help='입력 디렉토리 (rgb_cross/, rgb_parallel/ 하위 폴더 포함)')
+                       help='입력 디렉토리 (rgb_cross/, rgb_parallel/ 하위 폴더 포함)\n'
+                            'GT가 있으면 gt_brown/, gt_red/, gt_wrinkle/ 폴더 추가')
     batch.add_argument('--batch_size',  type=int, default=8,
                        help='배치 크기 (기본: 8)')
     batch.add_argument('--num_workers', type=int, default=4,
@@ -436,6 +562,40 @@ def main():
         with open(score_path, 'w', encoding='utf-8') as f:
             json.dump(scores, f, ensure_ascii=False, indent=2)
 
+        # ── GT Dice 계산 ──────────────────────────────────────────────────────
+        gt_paths = {
+            'brown'  : Path(args.gt_brown)   if args.gt_brown   else None,
+            'red'    : Path(args.gt_red)     if args.gt_red     else None,
+            'wrinkle': Path(args.gt_wrinkle) if args.gt_wrinkle else None,
+        }
+        has_any_gt = any(p is not None and p.exists() for p in gt_paths.values())
+
+        if has_any_gt:
+            dice_lines = [
+                f'# Dice Scores — {stem}',
+                f'# (binary Dice coefficient, threshold=0.5)',
+                '#',
+            ]
+            print(f"\nDice Scores (binary, threshold=0.5):")
+
+            for tag, pred_key in [('brown', 'brown_mask'),
+                                   ('red',   'red_mask'),
+                                   ('wrinkle', 'wrinkle_mask')]:
+                gt_p = gt_paths[tag]
+                if gt_p is not None and gt_p.exists():
+                    gt_tensor = load_gray(gt_p, img_size)
+                    dice_val  = compute_dice(pred[pred_key], gt_tensor)
+                    dice_lines.append(
+                        f"  {tag}_dice    : {dice_val:.4f}  (GT: {gt_p.name})")
+                    print(f"  {tag}_dice    : {dice_val:.4f}  (GT: {gt_p.name})")
+                else:
+                    dice_lines.append(f"  {tag}_dice    : N/A     (GT 없음)")
+
+            dice_path = out_dir / f'{stem}_dice.txt'
+            with open(dice_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(dice_lines) + '\n')
+            print(f"  → {dice_path}")
+
         print(f"\n저장 완료:")
         print(f"  시각화  : {vis_path}")
         print(f"  스코어  : {score_path}")
@@ -462,6 +622,17 @@ def main():
         with open(scores_path, 'w', encoding='utf-8') as f:
             json.dump(all_scores, f, ensure_ascii=False, indent=2)
 
+        # Dice 결과가 있으면 txt 저장
+        has_dice = any(
+            s['brown_dice'] is not None or
+            s['red_dice']   is not None or
+            s['wrinkle_dice'] is not None
+            for s in all_scores
+        )
+        if has_dice:
+            dice_path = out_dir / 'dice_scores.txt'
+            _save_dice_txt_batch(all_scores, dice_path)
+
         # 요약 통계
         if all_scores:
             n = len(all_scores)
@@ -475,6 +646,16 @@ def main():
             print(f"  스코어 저장  : {scores_path}")
             print(f"  시각화 저장  : {out_dir / 'visualizations'}")
             print(f"  마스크 저장  : {out_dir / 'masks'}")
+
+            if has_dice:
+                b_vals = [s['brown_dice']   for s in all_scores if s['brown_dice']   is not None]
+                r_vals = [s['red_dice']     for s in all_scores if s['red_dice']     is not None]
+                w_vals = [s['wrinkle_dice'] for s in all_scores if s['wrinkle_dice'] is not None]
+                print(f"\nDice 요약 (binary, threshold=0.5):")
+                if b_vals: print(f"  mean_brown_dice   : {sum(b_vals)/len(b_vals):.4f}  (n={len(b_vals)})")
+                if r_vals: print(f"  mean_red_dice     : {sum(r_vals)/len(r_vals):.4f}  (n={len(r_vals)})")
+                if w_vals: print(f"  mean_wrinkle_dice : {sum(w_vals)/len(w_vals):.4f}  (n={len(w_vals)})")
+                print(f"  Dice 저장        : {dice_path}")
 
     else:
         raise ValueError(
