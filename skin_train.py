@@ -100,11 +100,11 @@ def save_preview(model, preview_loader, device, epoch, save_dir: Path, n_images:
             if saved >= n_images:
                 break
 
-            # 각 채널을 0~1 범위로 클램프
-            inp   = rgb_cross[i].cpu().clamp(0, 1)           # [3,H,W]
-            brown = result.brown_mask[i].cpu().clamp(0, 1)   # [1,H,W]
-            red   = result.red_mask[i].cpu().clamp(0, 1)     # [1,H,W]
-            wrk   = result.wrinkle_mask[i].cpu().clamp(0, 1) # [1,H,W]
+            # logit → 확률 변환 후 0~1 클램프
+            inp   = rgb_cross[i].cpu().clamp(0, 1)                              # [3,H,W]
+            brown = torch.sigmoid(result.brown_mask[i]).cpu().clamp(0, 1)       # [1,H,W]
+            red   = torch.sigmoid(result.red_mask[i]).cpu().clamp(0, 1)         # [1,H,W]
+            wrk   = torch.sigmoid(result.wrinkle_mask[i]).cpu().clamp(0, 1)     # [1,H,W]
 
             # 단채널 → RGB 반복
             brown_rgb = brown.repeat(3, 1, 1)

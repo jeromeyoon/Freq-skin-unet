@@ -41,10 +41,13 @@ def _dice_loss_per_sample(pred:      torch.Tensor,
     """
     샘플별 Dice Loss 반환.  [B] 크기 텐서.
 
-    pred / gt / face_mask : [B, 1, H, W]
+    pred      : [B, 1, H, W]  logit (sigmoid 적용 전)
+    gt        : [B, 1, H, W]  확률 GT
+    face_mask : [B, 1, H, W]
     """
+    prob = torch.sigmoid(pred)         # logit → prob
     # 피부 영역 내 픽셀만 고려
-    p = pred * face_mask              # [B,1,H,W]
+    p = prob * face_mask              # [B,1,H,W]
     g = gt   * face_mask              # [B,1,H,W]
 
     # 샘플별 합산 → [B]
@@ -59,8 +62,10 @@ def _dice_loss_per_sample(pred:      torch.Tensor,
 def _bce_per_pixel(pred:      torch.Tensor,
                    gt:        torch.Tensor,
                    face_mask: torch.Tensor) -> torch.Tensor:
-    """BCE를 피부 영역에만 적용. [B,1,H,W] 반환."""
-    bce = F.binary_cross_entropy(pred, gt, reduction='none')
+    """BCE를 피부 영역에만 적용. [B,1,H,W] 반환.
+    pred : logit (binary_cross_entropy_with_logits 사용 → 수치 안정)
+    """
+    bce = F.binary_cross_entropy_with_logits(pred, gt, reduction='none')
     return bce * face_mask             # [B,1,H,W]
 
 
@@ -72,11 +77,13 @@ def _focal_per_pixel(pred:      torch.Tensor,
     """
     Focal Loss를 피부 영역에만 적용. [B,1,H,W] 반환.
 
+    pred  : logit (sigmoid 전) — binary_cross_entropy_with_logits 사용
     gamma : 어려운 샘플 집중 계수 (2.0 권장)
     alpha : 양성 가중치 (주름 희소성 보완)
     """
-    bce   = F.binary_cross_entropy(pred, gt, reduction='none')  # [B,1,H,W]
-    p_t   = torch.where(gt > 0.5, pred, 1.0 - pred)             # 예측 확률
+    bce   = F.binary_cross_entropy_with_logits(pred, gt, reduction='none')  # [B,1,H,W]
+    prob  = torch.sigmoid(pred)
+    p_t   = torch.where(gt > 0.5, prob, 1.0 - prob)             # 예측 확률
     focal = alpha * (1.0 - p_t) ** gamma * bce
     return focal * face_mask           # [B,1,H,W]
 
@@ -182,10 +189,13 @@ class SkinAnalyzerLoss(nn.Module):
                     gt:        torch.Tensor,
                     face_mask: torch.Tensor,
                     has_gt:    list[bool]) -> torch.Tensor:
-        """조명 consistency loss에서 augmented 예측끼리 비교 시 사용."""
+        """조명 consistency loss에서 augmented 예측끼리 비교 시 사용.
+        pred / gt : logit — sigmoid 공간에서 비교 (0~1 범위로 정규화)
+        """
         gt_avail  = torch.tensor(has_gt, dtype=torch.float32,
                                  device=pred.device).view(-1, 1, 1, 1)
-        per_pixel = F.l1_loss(pred, gt, reduction='none') * face_mask * gt_avail
+        per_pixel = F.l1_loss(torch.sigmoid(pred), torch.sigmoid(gt),
+                              reduction='none') * face_mask * gt_avail
         denom     = (face_mask * gt_avail).sum().clamp(min=1.0)
         return per_pixel.sum() / denom
 
@@ -204,7 +214,9 @@ class SkinAnalyzerLoss(nn.Module):
         if not any(has_any):
             return torch.tensor(0.0, device=rgb_cross.device)
 
-        od_recon  = brown_mask * self.mel_abs + red_mask * self.hem_abs
+        brown_prob = torch.sigmoid(brown_mask)
+        red_prob   = torch.sigmoid(red_mask)
+        od_recon  = brown_prob * self.mel_abs + red_prob * self.hem_abs
         rgb_recon = torch.exp(-od_recon).clamp(0.0, 1.0)
 
         avail = torch.tensor(has_any, dtype=torch.float32,

@@ -123,9 +123,10 @@ class SpotHead(nn.Module):
         d2 = self.up2(d3,         c2)
         d1 = self.up1(d2,         c1)
 
-        mask  = torch.sigmoid(self.head(d1))   # [B, 1, H, W]
-        score = _compute_score(mask, skin_mask) # [B]
-        return mask, score
+        logit = self.head(d1)                          # [B, 1, H, W]  raw logit
+        prob  = torch.sigmoid(logit)
+        score = _compute_score(prob, skin_mask)        # [B]
+        return logit, score
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -180,6 +181,7 @@ class WrinkleHead(nn.Module):
                               mode='bilinear', align_corners=False)
 
         fused = torch.cat([t1, t2_up, t3_up], dim=1)   # [B, fused_ch, H, W]
-        mask  = torch.sigmoid(self.fuse(fused))          # [B, 1, H, W]
-        score = _compute_score(mask, skin_mask)           # [B]
-        return mask, score
+        logit = self.fuse(fused)                           # [B, 1, H, W]  raw logit
+        prob  = torch.sigmoid(logit)
+        score = _compute_score(prob, skin_mask)            # [B]
+        return logit, score
