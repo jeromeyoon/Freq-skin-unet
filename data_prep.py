@@ -93,9 +93,11 @@ def find_matching_gt(input_name: str,
     없으면 None.
 
     매칭 순서:
-    1. 정확히 일치
-    2. GT ID가 input_name에 포함 (예: "001" in "HONG_001")
-    3. input_name의 숫자 부분이 GT ID와 일치 (zero-padding 무시)
+    1. 정확히 일치                       "M100010006"   == "M100010006"
+    2. '-' 앞 부분으로 매칭              "M100010006-M7910" → "M100010006"
+    3. '_' 앞 부분으로 매칭              "M100010006_extra" → "M100010006"
+    4. GT ID가 input_name에 포함         "M100010006" in "M100010006-M7910"
+    5. 숫자 추출 후 매칭 (마지막 fallback)
     """
     if not gt_map:
         return None
@@ -104,16 +106,25 @@ def find_matching_gt(input_name: str,
     if input_name in gt_map:
         return gt_map[input_name]
 
-    # 2. GT ID ⊂ input_name
+    # 2. '-' 기준 앞 부분 추출 후 매칭  (M100010006-M7910 → M100010006)
+    prefix_dash = input_name.split('-')[0]
+    if prefix_dash in gt_map:
+        return gt_map[prefix_dash]
+
+    # 3. '_' 기준 앞 부분 추출 후 매칭
+    prefix_under = input_name.split('_')[0]
+    if prefix_under in gt_map:
+        return gt_map[prefix_under]
+
+    # 4. GT ID ⊂ input_name
     for gt_id, path in gt_map.items():
         if gt_id in input_name:
             return path
 
-    # 3. 숫자 추출 후 zero-padding 무시 비교
+    # 5. 숫자 추출 후 zero-padding 무시 비교 (마지막 fallback)
     input_nums = _extract_numeric(input_name)
     for gt_id, path in gt_map.items():
         gt_nums = _extract_numeric(gt_id)
-        # 한 쪽이라도 숫자가 lstrip('0')으로 일치하면 매핑
         for inum in input_nums:
             for gnum in gt_nums:
                 if inum.lstrip('0') == gnum.lstrip('0') and inum.lstrip('0') != '':
