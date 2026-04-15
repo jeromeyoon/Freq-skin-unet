@@ -43,6 +43,23 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 
 
+# ── 모듈 레벨 이미지 로더 (두 Dataset 클래스에서 공유) ────────────────────────
+def _load_rgb(path: Path, img_size: int) -> torch.Tensor:
+    """RGB 이미지 로드. [3, H, W] float 0~1"""
+    img = Image.open(path).convert('RGB').resize(
+        (img_size, img_size), Image.BILINEAR)
+    return TF.to_tensor(img)
+
+
+def _load_gray(path: Path, img_size: int) -> torch.Tensor:
+    """그레이스케일 이미지 로드 (GT 마스크 전용). [1, H, W] float 0~1
+    NEAREST 보간: 이진 마스크 경계값 오염 방지
+    """
+    img = Image.open(path).convert('L').resize(
+        (img_size, img_size), Image.NEAREST)
+    return TF.to_tensor(img)
+
+
 class SkinDataset(Dataset):
 
     def __init__(self,
@@ -99,16 +116,6 @@ class SkinDataset(Dataset):
     def __len__(self):
         return len(self.stems)
 
-    def _load_rgb(self, path: Path) -> torch.Tensor:
-        img = Image.open(path).convert('RGB').resize(
-            (self.img_size, self.img_size), Image.BILINEAR)
-        return TF.to_tensor(img)   # [3, H, W]  0~1
-
-    def _load_gray(self, path: Path) -> torch.Tensor:
-        img = Image.open(path).convert('L').resize(
-            (self.img_size, self.img_size), Image.BILINEAR)
-        return TF.to_tensor(img)   # [1, H, W]  0~1
-
     def _apply_augment(self, *tensors):
         """동일한 geometric augment를 모든 텐서에 적용 (None 안전)"""
         do_hflip = random.random() > 0.5
@@ -130,12 +137,12 @@ class SkinDataset(Dataset):
         info = self.manifest[stem]
 
         # 필수 입력 (항상 존재)
-        rgb_cross    = self._load_rgb(self.patch_dir / 'rgb_cross'    / f'{stem}.png')
-        rgb_parallel = self._load_rgb(self.patch_dir / 'rgb_parallel' / f'{stem}.png')
+        rgb_cross    = _load_rgb(self.patch_dir / 'rgb_cross'    / f'{stem}.png', self.img_size)
+        rgb_parallel = _load_rgb(self.patch_dir / 'rgb_parallel' / f'{stem}.png', self.img_size)
 
         # 마스크 (없으면 전체 영역)
         mask_path = self.patch_dir / 'mask' / f'{stem}.png'
-        mask = self._load_gray(mask_path) if mask_path.exists() \
+        mask = _load_gray(mask_path, self.img_size) if mask_path.exists() \
                else torch.ones(1, self.img_size, self.img_size)
 
         # GT (부분 로드)
@@ -143,7 +150,7 @@ class SkinDataset(Dataset):
             if not info.get(f'has_{task}', False):
                 return None
             gt_path = self.patch_dir / task / f'{stem}.png'
-            return self._load_gray(gt_path) if gt_path.exists() else None
+            return _load_gray(gt_path, self.img_size) if gt_path.exists() else None
 
         brown   = load_gt('brown')
         red     = load_gt('red')
@@ -241,24 +248,14 @@ class ExcludedDataset(Dataset):
     def __len__(self):
         return len(self.stems)
 
-    def _load_rgb(self, path: Path) -> torch.Tensor:
-        img = Image.open(path).convert('RGB').resize(
-            (self.img_size, self.img_size), Image.BILINEAR)
-        return TF.to_tensor(img)
-
-    def _load_gray(self, path: Path) -> torch.Tensor:
-        img = Image.open(path).convert('L').resize(
-            (self.img_size, self.img_size), Image.BILINEAR)
-        return TF.to_tensor(img)
-
     def __getitem__(self, idx: int) -> dict:
         stem = self.stems[idx]
 
-        rgb_cross    = self._load_rgb(self.patch_dir / 'rgb_cross'    / f'{stem}.png')
-        rgb_parallel = self._load_rgb(self.patch_dir / 'rgb_parallel' / f'{stem}.png')
+        rgb_cross    = _load_rgb(self.patch_dir / 'rgb_cross'    / f'{stem}.png', self.img_size)
+        rgb_parallel = _load_rgb(self.patch_dir / 'rgb_parallel' / f'{stem}.png', self.img_size)
 
         mask_path = self.patch_dir / 'mask' / f'{stem}.png'
-        mask = self._load_gray(mask_path) if mask_path.exists() \
+        mask = _load_gray(mask_path, self.img_size) if mask_path.exists() \
                else torch.ones(1, self.img_size, self.img_size)
 
         return {

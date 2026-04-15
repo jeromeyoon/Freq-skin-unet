@@ -16,6 +16,8 @@ SkinAnalyzer 듀얼 편광 + 부분 GT 학습 스크립트
   python skin_train.py
 """
 
+import random
+import numpy as np
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
@@ -61,6 +63,8 @@ CFG = dict(
     color_temp_range  = (0.7, 1.3),
     tint_range        = (0.8, 1.2),
     vignette_prob     = 0.3,
+
+    seed              = 42,
 
     # 학습 제외 이미지 시각화
     preview_interval  = 10,    # N 에폭마다 저장 (0이면 비활성)
@@ -245,8 +249,16 @@ def validate(model, loader, criterion, device):
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
+    # 재현성을 위한 random seed 고정
+    seed = CFG['seed']
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
+    print(f"Device: {device}  |  Seed: {seed}")
 
     Path(CFG['checkpoint_dir']).mkdir(parents=True, exist_ok=True)
 
