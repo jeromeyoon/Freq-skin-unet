@@ -21,9 +21,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from pathlib import Path
 
+import torchvision.utils as vutils
+import torchvision.transforms.functional as TF
+
 from skin_net     import build_analyzer
 from skin_loss    import SkinAnalyzerLoss, get_loss_weights
-from skin_dataset import SkinDataset, skin_collate_fn
+from skin_dataset import SkinDataset, skin_collate_fn, ExcludedDataset, preview_collate_fn
 from ambient_aug  import apply_batch_illumination_aug
 
 
@@ -57,7 +60,67 @@ CFG = dict(
     color_temp_range  = (0.7, 1.3),
     tint_range        = (0.8, 1.2),
     vignette_prob     = 0.3,
+
+    # 학습 제외 이미지 시각화
+    preview_interval  = 10,    # N 에폭마다 저장 (0이면 비활성)
+    preview_n_images  = 8,     # 저장할 이미지 수
+    preview_dir       = './previews',
 )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 학습 제외 이미지 예측 결과 시각화
+# ══════════════════════════════════════════════════════════════════════════════
+@torch.no_grad()
+def save_preview(model, preview_loader, device, epoch, save_dir: Path, n_images: int):
+    """
+    GT 없는(학습 제외) 이미지에 대한 예측 결과를 이미지로 저장.
+
+    저장 형식: {save_dir}/epoch_{epoch:03d}/{stem}.png
+    각 이미지: [rgb_cross | brown_pred | red_pred | wrinkle_pred] 가로 나열
+    """
+    model.eval()
+    save_dir = save_dir / f'epoch_{epoch:03d}'
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    saved = 0
+    for batch in preview_loader:
+        if saved >= n_images:
+            break
+
+        rgb_cross    = batch['rgb_cross'].to(device)
+        rgb_parallel = batch['rgb_parallel'].to(device)
+        mask         = batch['mask'].to(device)
+        stems        = batch['stem']
+
+        result = model(rgb_cross, rgb_parallel, mask)
+
+        for i in range(rgb_cross.shape[0]):
+            if saved >= n_images:
+                break
+
+            # 각 채널을 0~1 범위로 클램프
+            inp   = rgb_cross[i].cpu().clamp(0, 1)           # [3,H,W]
+            brown = result.brown_mask[i].cpu().clamp(0, 1)   # [1,H,W]
+            red   = result.red_mask[i].cpu().clamp(0, 1)     # [1,H,W]
+            wrk   = result.wrinkle_mask[i].cpu().clamp(0, 1) # [1,H,W]
+
+            # 단채널 → RGB 반복
+            brown_rgb = brown.repeat(3, 1, 1)
+            red_rgb   = red.repeat(3, 1, 1)
+            wrk_rgb   = wrk.repeat(3, 1, 1)
+
+            # 가로 격자: [입력 | brown | red | wrinkle]
+            grid = vutils.make_grid(
+                torch.stack([inp, brown_rgb, red_rgb, wrk_rgb]),
+                nrow=4, padding=2, normalize=False,
+            )
+            img = TF.to_pil_image(grid)
+            img.save(save_dir / f'{stems[i]}.png')
+            saved += 1
+
+    if saved:
+        print(f"  Preview 저장: {save_dir}  ({saved}장)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -192,6 +255,23 @@ def main():
     )
     print(f"Train: {len(train_ds)} / Val: {len(val_ds)}")
 
+    # 학습 제외 이미지 (GT 없음) → 시각화 전용 loader
+    preview_loader = None
+    if CFG['preview_interval'] > 0:
+        excl_ds = ExcludedDataset.from_skin_dataset(full_ds)
+        if len(excl_ds) > 0:
+            preview_loader = DataLoader(
+                excl_ds,
+                batch_size  = CFG['preview_n_images'],
+                shuffle     = True,
+                num_workers = 0,
+                collate_fn  = preview_collate_fn,
+            )
+            print(f"Preview 대상: {len(excl_ds)}장 "
+                  f"(매 {CFG['preview_interval']} 에폭마다 저장)")
+        else:
+            print("Preview 대상 없음 (GT 없는 패치가 존재하지 않음)")
+
     criterion = SkinAnalyzerLoss(
         w_brown    = CFG['w_brown'],
         w_red      = CFG['w_red'],
@@ -245,6 +325,17 @@ def main():
                 'cfg'       : CFG,
             }, Path(CFG['checkpoint_dir']) / 'best_skin_analyzer.pth')
             print(f"  Best 저장: val={best_val:.4f}")
+
+        # 학습 제외 이미지 예측 결과 시각화
+        if (preview_loader is not None
+                and CFG['preview_interval'] > 0
+                and epoch % CFG['preview_interval'] == 0):
+            save_preview(
+                model, preview_loader, device,
+                epoch,
+                save_dir  = Path(CFG['preview_dir']),
+                n_images  = CFG['preview_n_images'],
+            )
 
     print("\n학습 완료!")
 

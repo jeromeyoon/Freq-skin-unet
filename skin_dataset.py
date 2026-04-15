@@ -76,16 +76,23 @@ class SkinDataset(Dataset):
 
         # brown / red / wrinkle 이 전부 False인 패치 제외
         # → 어떤 GT도 없는 샘플은 지도학습 신호가 없으므로 학습 불필요
+        # → 제외된 stems는 self.excluded_stems 에 보관 (시각화용)
         before = len(self.stems)
+        self.excluded_stems = [
+            stem for stem in self.stems
+            if not any(self.manifest[stem].get(f'has_{t}', False)
+                       for t in ('brown', 'red', 'wrinkle'))
+        ]
         self.stems = [
             stem for stem in self.stems
             if any(self.manifest[stem].get(f'has_{t}', False)
                    for t in ('brown', 'red', 'wrinkle'))
         ]
-        excluded = before - len(self.stems)
+        excluded = len(self.excluded_stems)
         if excluded:
             print(f"[SkinDataset] GT 없는 패치 {excluded}개 제외 "
-                  f"({before} → {len(self.stems)})")
+                  f"({before} → {len(self.stems)})  "
+                  f"→ ExcludedDataset 으로 시각화 가능")
 
         assert len(self.stems) > 0, f"패치를 찾을 수 없습니다: {patch_dir}"
 
@@ -194,3 +201,79 @@ def skin_collate_fn(batch: list) -> dict:
 
     out['stem'] = [b['stem'] for b in batch]
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ExcludedDataset : GT 없는 패치 (시각화 전용)
+# ══════════════════════════════════════════════════════════════════════════════
+class ExcludedDataset(Dataset):
+    """
+    SkinDataset에서 학습에서 제외된 패치 (GT 전부 없음) 를 로드.
+
+    예측 결과를 학습 도중 시각화하여 모델이 unsupervised 영역에서도
+    그럴듯한 출력을 내는지 모니터링하는 용도.
+
+    Usage
+    -----
+        skin_ds  = SkinDataset(patch_dir)
+        prev_ds  = ExcludedDataset.from_skin_dataset(skin_ds)
+        prev_loader = DataLoader(prev_ds, batch_size=4,
+                                 collate_fn=preview_collate_fn)
+    """
+
+    def __init__(self,
+                 patch_dir     : str,
+                 excluded_stems: list,
+                 img_size      : int = 256):
+        self.patch_dir = Path(patch_dir)
+        self.stems     = excluded_stems
+        self.img_size  = img_size
+
+    @classmethod
+    def from_skin_dataset(cls, skin_ds: 'SkinDataset') -> 'ExcludedDataset':
+        """SkinDataset 인스턴스로부터 생성 (excluded_stems 재사용)"""
+        return cls(
+            patch_dir      = str(skin_ds.patch_dir),
+            excluded_stems = skin_ds.excluded_stems,
+            img_size       = skin_ds.img_size,
+        )
+
+    def __len__(self):
+        return len(self.stems)
+
+    def _load_rgb(self, path: Path) -> torch.Tensor:
+        img = Image.open(path).convert('RGB').resize(
+            (self.img_size, self.img_size), Image.BILINEAR)
+        return TF.to_tensor(img)
+
+    def _load_gray(self, path: Path) -> torch.Tensor:
+        img = Image.open(path).convert('L').resize(
+            (self.img_size, self.img_size), Image.BILINEAR)
+        return TF.to_tensor(img)
+
+    def __getitem__(self, idx: int) -> dict:
+        stem = self.stems[idx]
+
+        rgb_cross    = self._load_rgb(self.patch_dir / 'rgb_cross'    / f'{stem}.png')
+        rgb_parallel = self._load_rgb(self.patch_dir / 'rgb_parallel' / f'{stem}.png')
+
+        mask_path = self.patch_dir / 'mask' / f'{stem}.png'
+        mask = self._load_gray(mask_path) if mask_path.exists() \
+               else torch.ones(1, self.img_size, self.img_size)
+
+        return {
+            'rgb_cross'   : rgb_cross,
+            'rgb_parallel': rgb_parallel,
+            'mask'        : mask,
+            'stem'        : stem,
+        }
+
+
+def preview_collate_fn(batch: list) -> dict:
+    """ExcludedDataset 전용 collate (GT 없음)"""
+    return {
+        'rgb_cross'   : torch.stack([b['rgb_cross']    for b in batch]),
+        'rgb_parallel': torch.stack([b['rgb_parallel'] for b in batch]),
+        'mask'        : torch.stack([b['mask']         for b in batch]),
+        'stem'        : [b['stem'] for b in batch],
+    }
