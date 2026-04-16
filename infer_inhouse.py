@@ -22,6 +22,7 @@ GT가 있는 샘플은 Dice score를 계산해 요약 저장.
 ---------
     out_dir/
         masks/
+            skin/     {stem}.png   ← 자동 생성 피부 마스크
             brown/    {stem}.png
             red/      {stem}.png
             wrinkle/  {stem}.png
@@ -55,12 +56,14 @@ from PIL import Image
 from tqdm import tqdm
 
 from in_house_dataload import build_file_list
+from skin_mask_gen import generate_skin_mask
 from skin_infer import (
     load_model,
+    load_rgb_full,
+    load_gray_full,
     infer_single,
     compute_dice,
     save_visualization,
-    load_gray_full,
 )
 
 
@@ -184,13 +187,15 @@ def run_inhouse_infer(
     save_vis:         bool  = True,
     save_masks:       bool  = True,
     mask_threshold:   float = 0.5,
+    use_mediapipe:    bool  = True,
 ) -> list[dict]:
     """
     파일 리스트 전체에 대해 추론 + Dice 계산.
 
     Parameters
     ----------
-    records : build_file_list() 반환값
+    records       : build_file_list() 반환값
+    use_mediapipe : True면 MediaPipe 우선, 없으면 색상 기반 폴백
     """
     vis_dir  = out_dir / 'visualizations'
     mask_dir = out_dir / 'masks'
@@ -198,27 +203,34 @@ def run_inhouse_infer(
     if save_vis:
         vis_dir.mkdir(parents=True, exist_ok=True)
     if save_masks:
-        for tag in ('brown', 'red', 'wrinkle'):
+        for tag in ('skin', 'brown', 'red', 'wrinkle'):
             (mask_dir / tag).mkdir(parents=True, exist_ok=True)
 
     all_scores: list[dict] = []
     pbar = tqdm(records, desc='사내 데이터셋 추론', unit='img', dynamic_ncols=True)
 
     for rec in pbar:
-        stem         = rec['stem']
-        cross_path   = rec['rgb_cross']
-        parallel_path= rec['rgb_parallel']
+        stem          = rec['stem']
+        cross_path    = rec['rgb_cross']
+        parallel_path = rec['rgb_parallel']
 
         pbar.set_description(f'추론: {stem}')
+
+        # ── 피부 마스크 생성 ──────────────────────────────────────────────────
+        rgb_full  = load_rgb_full(cross_path)           # [3, H, W]
+        skin_mask = generate_skin_mask(
+            rgb_full,
+            use_mediapipe = use_mediapipe,
+        )                                               # [1, H, W] binary
 
         # ── 추론 ──────────────────────────────────────────────────────────────
         pred = infer_single(
             model            = model,
             cross_path       = cross_path,
             parallel_path    = parallel_path,
-            mask_path        = None,          # 사내 데이터는 피부 마스크 없음 (전체 영역)
             img_size         = img_size,
             device           = device,
+            skin_mask        = skin_mask,
             patch_size       = patch_size,
             overlap          = overlap,
             patch_batch_size = patch_batch_size,
@@ -253,14 +265,23 @@ def run_inhouse_infer(
                 wrinkle_score = pred['wrinkle_score'],
             )
 
-        # ── 마스크 저장 (threshold 적용 → 이진 마스크) ────────────────────────
+        # ── 마스크 저장 ───────────────────────────────────────────────────────
         if save_masks:
-            brown_bin   = (brown_prob   >= mask_threshold).float()
-            red_bin     = (red_prob     >= mask_threshold).float()
-            wrinkle_bin = (wrinkle_prob >= mask_threshold).float()
-            TF.to_pil_image(brown_bin).save(  mask_dir / 'brown'   / f'{stem}.png')
-            TF.to_pil_image(red_bin).save(    mask_dir / 'red'     / f'{stem}.png')
-            TF.to_pil_image(wrinkle_bin).save(mask_dir / 'wrinkle' / f'{stem}.png')
+            # 피부 마스크 (생성된 것, 해상도 불일치 시 nearest 리사이즈)
+            if skin_mask.shape[1] != H or skin_mask.shape[2] != W:
+                skin_save = torch.nn.functional.interpolate(
+                    skin_mask.unsqueeze(0), (H, W), mode='nearest').squeeze(0)
+            else:
+                skin_save = skin_mask
+            TF.to_pil_image(skin_save).save(mask_dir / 'skin' / f'{stem}.png')
+
+            # 예측 마스크 (threshold 이진화)
+            TF.to_pil_image((brown_prob   >= mask_threshold).float()).save(
+                mask_dir / 'brown'   / f'{stem}.png')
+            TF.to_pil_image((red_prob     >= mask_threshold).float()).save(
+                mask_dir / 'red'     / f'{stem}.png')
+            TF.to_pil_image((wrinkle_prob >= mask_threshold).float()).save(
+                mask_dir / 'wrinkle' / f'{stem}.png')
 
         # ── 스코어 수집 ───────────────────────────────────────────────────────
         entry = {
@@ -328,6 +349,8 @@ def parse_args() -> argparse.Namespace:
                         choices=['auto', 'cuda', 'cpu'])
     parser.add_argument('--mask_threshold', type=float, default=0.5,
                         help='이진 마스크 저장 threshold (기본: 0.5)')
+    parser.add_argument('--no_mediapipe', action='store_true',
+                        help='MediaPipe 사용 안 함 → 색상 기반 피부 마스크만 사용')
 
     return parser.parse_args()
 
@@ -381,6 +404,7 @@ def main() -> None:
         save_vis         = not args.no_vis,
         save_masks       = not args.no_masks,
         mask_threshold   = args.mask_threshold,
+        use_mediapipe    = not args.no_mediapipe,
     )
 
     # ── 결과 저장 ──────────────────────────────────────────────────────────────

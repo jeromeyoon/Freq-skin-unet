@@ -304,18 +304,21 @@ def infer_patch_based(
 # ══════════════════════════════════════════════════════════════════════════════
 @torch.no_grad()
 def infer_single(
-    model:         SkinAnalyzer,
-    cross_path:    Path,
-    parallel_path: Path,
-    mask_path:     Path | None,
-    img_size:      int,
-    device:        torch.device,
-    patch_size:    int = 256,
-    overlap:       int = 64,
-    patch_batch_size: int = 8,
+    model:            SkinAnalyzer,
+    cross_path:       Path,
+    parallel_path:    Path,
+    img_size:         int,
+    device:           torch.device,
+    skin_mask:        torch.Tensor | None = None,   # [1, H, W] 사전 생성 마스크
+    mask_path:        Path | None         = None,   # 파일에서 로드 (skin_mask 없을 때)
+    patch_size:       int  = 256,
+    overlap:          int  = 64,
+    patch_batch_size: int  = 8,
 ) -> dict:
     """
     단일 이미지 쌍 추론.
+
+    마스크 우선순위: skin_mask 텐서 > mask_path 파일 > 전체 영역(ones)
 
     이미지 크기 > patch_size 이면 자동으로 슬라이딩 윈도우 패치 추론.
     그렇지 않으면 img_size로 리사이즈 후 단일 pass 추론.
@@ -339,16 +342,18 @@ def infer_single(
         rgb_cross    = load_rgb_full(cross_path)
         rgb_parallel = load_rgb_full(parallel_path)
 
-        if mask_path is not None and mask_path.exists():
-            skin_mask = load_gray_full(mask_path)
+        if skin_mask is not None:
+            resolved_mask = skin_mask
+        elif mask_path is not None and mask_path.exists():
+            resolved_mask = load_gray_full(mask_path)
         else:
-            skin_mask = torch.ones(1, orig_H, orig_W)
+            resolved_mask = torch.ones(1, orig_H, orig_W)
 
         return infer_patch_based(
             model        = model,
             rgb_cross    = rgb_cross,
             rgb_parallel = rgb_parallel,
-            skin_mask    = skin_mask,
+            skin_mask    = resolved_mask,
             patch_size   = patch_size,
             overlap      = overlap,
             batch_size   = patch_batch_size,
@@ -356,11 +361,16 @@ def infer_single(
         )
 
     else:
-        # 소형 이미지: 기존 단일 pass 추론
+        # 소형 이미지: 단일 pass 추론
         rgb_cross    = load_rgb(cross_path,    img_size).unsqueeze(0).to(device)
         rgb_parallel = load_rgb(parallel_path, img_size).unsqueeze(0).to(device)
 
-        if mask_path is not None and mask_path.exists():
+        if skin_mask is not None:
+            # 모델 입력 크기에 맞게 리사이즈
+            mask = F.interpolate(
+                skin_mask.unsqueeze(0), size=(img_size, img_size),
+                mode='nearest').to(device)
+        elif mask_path is not None and mask_path.exists():
             mask = load_gray(mask_path, img_size).unsqueeze(0).to(device)
         else:
             mask = None
@@ -649,9 +659,9 @@ def main():
             model            = model,
             cross_path       = cross_path,
             parallel_path    = parallel_path,
-            mask_path        = mask_path,
             img_size         = img_size,
             device           = device,
+            mask_path        = mask_path,
             patch_size       = args.patch_size,
             overlap          = args.overlap,
             patch_batch_size = args.patch_batch_size,
