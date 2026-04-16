@@ -183,6 +183,7 @@ def run_inhouse_infer(
     patch_batch_size: int   = 8,
     save_vis:         bool  = True,
     save_masks:       bool  = True,
+    mask_threshold:   float = 0.5,
 ) -> list[dict]:
     """
     파일 리스트 전체에 대해 추론 + Dice 계산.
@@ -252,11 +253,14 @@ def run_inhouse_infer(
                 wrinkle_score = pred['wrinkle_score'],
             )
 
-        # ── 마스크 저장 ───────────────────────────────────────────────────────
+        # ── 마스크 저장 (threshold 적용 → 이진 마스크) ────────────────────────
         if save_masks:
-            TF.to_pil_image(brown_prob).save(  mask_dir / 'brown'   / f'{stem}.png')
-            TF.to_pil_image(red_prob).save(    mask_dir / 'red'     / f'{stem}.png')
-            TF.to_pil_image(wrinkle_prob).save(mask_dir / 'wrinkle' / f'{stem}.png')
+            brown_bin   = (brown_prob   >= mask_threshold).float()
+            red_bin     = (red_prob     >= mask_threshold).float()
+            wrinkle_bin = (wrinkle_prob >= mask_threshold).float()
+            TF.to_pil_image(brown_bin).save(  mask_dir / 'brown'   / f'{stem}.png')
+            TF.to_pil_image(red_bin).save(    mask_dir / 'red'     / f'{stem}.png')
+            TF.to_pil_image(wrinkle_bin).save(mask_dir / 'wrinkle' / f'{stem}.png')
 
         # ── 스코어 수집 ───────────────────────────────────────────────────────
         entry = {
@@ -322,6 +326,8 @@ def parse_args() -> argparse.Namespace:
                         help='한 번에 GPU에 올릴 패치 수')
     parser.add_argument('--device', default='auto',
                         choices=['auto', 'cuda', 'cpu'])
+    parser.add_argument('--mask_threshold', type=float, default=0.5,
+                        help='이진 마스크 저장 threshold (기본: 0.5)')
 
     return parser.parse_args()
 
@@ -374,6 +380,7 @@ def main() -> None:
         patch_batch_size = args.patch_batch_size,
         save_vis         = not args.no_vis,
         save_masks       = not args.no_masks,
+        mask_threshold   = args.mask_threshold,
     )
 
     # ── 결과 저장 ──────────────────────────────────────────────────────────────

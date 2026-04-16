@@ -94,17 +94,17 @@ def load_gray_full(path: Path) -> torch.Tensor:
 # Dice Score 계산
 # ══════════════════════════════════════════════════════════════════════════════
 def compute_dice(pred_prob: torch.Tensor,
-                 gt_prob:   torch.Tensor,
+                 gt_mask:   torch.Tensor,
                  threshold: float = 0.5,
                  smooth:    float = 1.0) -> float:
     """
     Binary Dice coefficient (평가용).
 
-    pred_prob : [1, H, W]  sigmoid 적용된 확률맵 (0~1)
-    gt_prob   : [1, H, W]  GT 확률맵 (0~1, threshold 기준 이진화)
+    pred_prob : [1, H, W]  sigmoid 적용된 확률맵 (0~1) → threshold로 이진화
+    gt_mask   : [1, H, W]  GT binary mask (0.0 or 1.0)  → 이미 이진이므로 round()
     """
     pred_bin = (pred_prob >= threshold).float()
-    gt_bin   = (gt_prob   >= threshold).float()
+    gt_bin   = gt_mask.round()                   # 0.0/1.0 — float 오차 방어
     inter    = (pred_bin * gt_bin).sum()
     dice     = (2.0 * inter + smooth) / (pred_bin.sum() + gt_bin.sum() + smooth)
     return dice.item()
@@ -525,9 +525,9 @@ def infer_directory(
                 brown_score=b_score, red_score=r_score, wrinkle_score=w_score,
             )
 
-            TF.to_pil_image(brown_prob).save(  mask_dir / 'brown'   / f'{stem}.png')
-            TF.to_pil_image(red_prob).save(    mask_dir / 'red'     / f'{stem}.png')
-            TF.to_pil_image(wrinkle_prob).save(mask_dir / 'wrinkle' / f'{stem}.png')
+            TF.to_pil_image((brown_prob   >= 0.5).float()).save(mask_dir / 'brown'   / f'{stem}.png')
+            TF.to_pil_image((red_prob     >= 0.5).float()).save(mask_dir / 'red'     / f'{stem}.png')
+            TF.to_pil_image((wrinkle_prob >= 0.5).float()).save(mask_dir / 'wrinkle' / f'{stem}.png')
 
             all_scores.append({
                 'stem'         : stem,
@@ -668,10 +668,10 @@ def main():
             wrinkle_score=pred['wrinkle_score'],
         )
 
-        # 원본 해상도 마스크 저장
-        TF.to_pil_image(pred['brown_mask']).save(  out_dir / f'{stem}_brown.png')
-        TF.to_pil_image(pred['red_mask']).save(    out_dir / f'{stem}_red.png')
-        TF.to_pil_image(pred['wrinkle_mask']).save(out_dir / f'{stem}_wrinkle.png')
+        # 원본 해상도 마스크 저장 (이진화)
+        TF.to_pil_image((pred['brown_mask']   >= 0.5).float()).save(out_dir / f'{stem}_brown.png')
+        TF.to_pil_image((pred['red_mask']     >= 0.5).float()).save(out_dir / f'{stem}_red.png')
+        TF.to_pil_image((pred['wrinkle_mask'] >= 0.5).float()).save(out_dir / f'{stem}_wrinkle.png')
 
         scores = {
             'stem'         : stem,
@@ -710,13 +710,12 @@ def main():
                     # GT도 예측 마스크와 동일 해상도로 로드
                     with Image.open(gt_p) as _img:
                         gW, gH = _img.size
-                    gt_tensor = load_gray_full(gt_p) if (gH == H and gW == W) \
-                                else load_gray(gt_p, img_size)
-                    # 해상도 불일치 시 리사이즈
+                    gt_tensor = load_gray_full(gt_p)
+                    # 해상도 불일치 시 NEAREST 리사이즈 (binary mask 경계값 보호)
                     if gt_tensor.shape[1] != H or gt_tensor.shape[2] != W:
                         gt_tensor = F.interpolate(
                             gt_tensor.unsqueeze(0), (H, W),
-                            mode='bilinear', align_corners=False).squeeze(0)
+                            mode='nearest').squeeze(0)
                     dice_val = compute_dice(pred[pred_key], gt_tensor)
                     dice_lines.append(
                         f"  {tag}_dice    : {dice_val:.4f}  (GT: {gt_p.name})")
