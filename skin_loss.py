@@ -319,10 +319,25 @@ class SkinAnalyzerLoss(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 # 단계별 Loss 가중치 스케줄
 # ══════════════════════════════════════════════════════════════════════════════
-def get_loss_weights(epoch: int, total_epochs: int) -> dict:
+def get_loss_weights(epoch:        int,
+                     total_epochs: int,
+                     w_brown:      float = 1.0,
+                     w_red:        float = 1.0,
+                     w_wrinkle:    float = 1.0,
+                     w_recon:      float = 0.3) -> dict:
+    """
+    단계별 loss 가중치 반환.
+
+    w_brown / w_red / w_wrinkle / w_recon 은 CFG 값을 그대로 사용.
+    w_consist / w_freq_reg 만 단계별 스케줄로 제어.
+
+    Phase 1 (0~40%) : supervised + recon
+    Phase 2 (40~80%): + consistency (조명 불변성 강화)
+    Phase 3 (80~100%): + freq_reg  (주파수 게이트 정규화)
+    """
     progress = epoch / total_epochs
-    base = dict(w_brown=1.0, w_red=1.0, w_wrinkle=1.0,
-                w_recon=0.3, w_consist=0.0, w_freq_reg=0.0)
+    base = dict(w_brown=w_brown, w_red=w_red, w_wrinkle=w_wrinkle,
+                w_recon=w_recon, w_consist=0.0, w_freq_reg=0.0)
     if progress < 0.4:
         return base
     if progress < 0.8:

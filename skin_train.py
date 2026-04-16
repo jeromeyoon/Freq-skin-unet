@@ -59,10 +59,12 @@ CFG = dict(
     w_consist      = 0.0,
     w_freq_reg     = 0.0,
 
-    intensity_range   = (0.5, 1.8),
-    color_temp_range  = (0.7, 1.3),
+    # 실내 조명 특화 augmentation 파라미터
+    intensity_range   = (0.6, 1.4),   # 실내: 극단적 밝기 변화 없음 (0.5~1.8 → 좁힘)
+    color_temp_range  = (0.7, 1.3),   # 백열(warm) ↔ 형광/LED(cool) 범위
     tint_range        = (0.8, 1.2),
-    vignette_prob     = 0.3,
+    vignette_prob     = 0.5,          # 국소 조명 확률 상향 (0.3 → 0.5)
+    gradient_prob     = 0.5,          # 천장/창문 방향성 그라데이션 확률
 
     seed              = 42,
 
@@ -141,6 +143,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg, epoch, tot
         color_temp_range = cfg['color_temp_range'],
         tint_range       = cfg['tint_range'],
         vignette_prob    = cfg['vignette_prob'],
+        gradient_prob    = cfg['gradient_prob'],
     )
 
     pbar = tqdm(loader,
@@ -327,7 +330,13 @@ def main():
                      desc='Epochs', unit='ep', dynamic_ncols=True)
 
     for epoch in epoch_bar:
-        weights = get_loss_weights(epoch, CFG['epochs'])
+        weights = get_loss_weights(
+            epoch, CFG['epochs'],
+            w_brown   = CFG['w_brown'],
+            w_red     = CFG['w_red'],
+            w_wrinkle = CFG['w_wrinkle'],
+            w_recon   = CFG['w_recon'],
+        )
         for k, v in weights.items():
             setattr(criterion, k, v)
 
