@@ -160,21 +160,23 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg, epoch, tot
         has_red     = batch['has_red']
         has_wrinkle = batch['has_wrinkle']
 
-        result = model(rgb_cross, rgb_parallel, mask)
+        # 항상 조명 변형 입력으로 주 forward pass 수행 (Phase 1부터 조명 강인성 학습)
+        rgb_cross_aug    = apply_batch_illumination_aug(rgb_cross,    **aug_kwargs)
+        rgb_parallel_aug = apply_batch_illumination_aug(rgb_parallel, **aug_kwargs)
+        result = model(rgb_cross_aug, rgb_parallel_aug, mask)
 
         # Consistency augmentation:
-        # 증강 이미지로 forward pass (grad 필요) → 원본 예측을 pseudo-GT로 비교.
-        # result_aug: grad 있음 / result: detach → 증강 예측이 원본에 가까워지도록 학습.
+        # 원본 이미지로 forward pass → 증강 기반 예측(result)을 pseudo-GT로 비교.
+        # result_aug(원본 예측): grad 있음, result: detach → 원본 예측이 증강 예측에 가까워지도록 학습.
+        # 목적: 조명이 달라진 입력(aug)과 원본 입력의 예측이 일치 → 조명 불변성
         result_aug = None
         if criterion.w_consist > 0:
-            rgb_cross_aug    = apply_batch_illumination_aug(rgb_cross,    **aug_kwargs)
-            rgb_parallel_aug = apply_batch_illumination_aug(rgb_parallel, **aug_kwargs)
-            result_aug = model(rgb_cross_aug, rgb_parallel_aug, mask)
+            result_aug = model(rgb_cross, rgb_parallel, mask)
 
         loss, detail = criterion(
             result,
             brown_gt, red_gt, wrinkle_gt,
-            rgb_cross   = rgb_cross,
+            rgb_cross   = rgb_cross,    # recon loss: 원본 RGB와 비교 (Beer-Lambert 물리 전제)
             face_mask   = mask,
             has_brown   = has_brown,
             has_red     = has_red,
