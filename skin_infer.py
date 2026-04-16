@@ -93,20 +93,33 @@ def load_gray_full(path: Path) -> torch.Tensor:
 # ══════════════════════════════════════════════════════════════════════════════
 # Dice Score 계산
 # ══════════════════════════════════════════════════════════════════════════════
-def compute_dice(pred_prob: torch.Tensor,
-                 gt_mask:   torch.Tensor,
-                 threshold: float = 0.5,
-                 smooth:    float = 1.0) -> float:
+def compute_dice(pred_prob:  torch.Tensor,
+                 gt_mask:    torch.Tensor,
+                 skin_mask:  torch.Tensor | None = None,
+                 threshold:  float = 0.5,
+                 smooth:     float = 1.0) -> float:
     """
     Binary Dice coefficient (평가용).
 
-    pred_prob : [1, H, W]  sigmoid 적용된 확률맵 (0~1) → threshold로 이진화
-    gt_mask   : [1, H, W]  GT binary mask (0.0 or 1.0)  → 이미 이진이므로 round()
+    pred_prob : [1, H, W]  sigmoid 확률맵 (0~1) → threshold로 이진화
+    gt_mask   : [1, H, W]  GT binary mask (0.0 or 1.0)
+    skin_mask : [1, H, W]  피부 영역 마스크 — 지정 시 해당 영역에서만 Dice 계산
     """
     pred_bin = (pred_prob >= threshold).float()
-    gt_bin   = gt_mask.round()                   # 0.0/1.0 — float 오차 방어
-    inter    = (pred_bin * gt_bin).sum()
-    dice     = (2.0 * inter + smooth) / (pred_bin.sum() + gt_bin.sum() + smooth)
+    gt_bin   = gt_mask.round()                   # float 오차 방어
+
+    if skin_mask is not None:
+        # 해상도 불일치 시 nearest 리사이즈
+        if skin_mask.shape != pred_bin.shape:
+            skin_mask = F.interpolate(
+                skin_mask.unsqueeze(0), pred_bin.shape[1:],
+                mode='nearest').squeeze(0)
+        roi = skin_mask.round()
+        pred_bin = pred_bin * roi
+        gt_bin   = gt_bin   * roi
+
+    inter = (pred_bin * gt_bin).sum()
+    dice  = (2.0 * inter + smooth) / (pred_bin.sum() + gt_bin.sum() + smooth)
     return dice.item()
 
 

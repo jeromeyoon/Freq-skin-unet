@@ -241,16 +241,17 @@ def run_inhouse_infer(
         wrinkle_prob = pred['wrinkle_mask']
         H, W         = brown_prob.shape[1], brown_prob.shape[2]
 
-        # ── Dice 계산 ─────────────────────────────────────────────────────────
+        # ── Dice 계산 (피부 마스크 영역 내에서만) ────────────────────────────────
         dice: dict[str, float | None] = {}
+        pred_key_map = {'brown': brown_prob, 'red': red_prob, 'wrinkle': wrinkle_prob}
         for task in ('brown', 'red', 'wrinkle'):
             gt_path = rec[task]
             if gt_path is not None:
-                gt_tensor    = _load_gt_aligned(gt_path, H, W)
-                pred_key_map = {'brown': brown_prob, 'red': red_prob, 'wrinkle': wrinkle_prob}
-                dice[task]   = compute_dice(pred_key_map[task], gt_tensor)
+                gt_tensor  = _load_gt_aligned(gt_path, H, W)
+                dice[task] = compute_dice(
+                    pred_key_map[task], gt_tensor, skin_mask=skin_mask)
             else:
-                dice[task]   = None
+                dice[task] = None
 
         # ── 시각화 저장 ───────────────────────────────────────────────────────
         if save_vis:
