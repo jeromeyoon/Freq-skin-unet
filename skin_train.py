@@ -338,10 +338,18 @@ def main():
             raise FileNotFoundError(f"Resume 체크포인트를 찾을 수 없습니다: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(ckpt['state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        if 'optimizer_state_dict' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        else:
+            print("  [WARN] optimizer 상태 없음 → 초기화된 optimizer로 재개")
+        if 'scheduler_state_dict' in ckpt:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        else:
+            print("  [WARN] scheduler 상태 없음 → epoch 기준으로 스케줄러 재구성")
+            for _ in range(ckpt['epoch']):
+                scheduler.step()
         start_epoch = ckpt['epoch'] + 1
-        best_val    = ckpt.get('best_val', float('inf'))
+        best_val    = ckpt.get('best_val', ckpt.get('val_loss', {}).get('total', float('inf')))
         print(f"Resume: epoch {ckpt['epoch']} → {start_epoch}부터 재개  "
               f"(best_val={best_val:.4f}  lr={scheduler.get_last_lr()[0]:.2e})")
     # ─────────────────────────────────────────────────────────────────────────
