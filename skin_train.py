@@ -16,6 +16,7 @@ SkinAnalyzer 듀얼 편광 + 부분 GT 학습 스크립트
   python skin_train.py
 """
 
+import argparse
 import random
 import numpy as np
 import torch
@@ -254,6 +255,11 @@ def validate(model, loader, criterion, device):
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
+    parser = argparse.ArgumentParser(description='SkinAnalyzer 학습')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='재개할 체크포인트 경로 (last_checkpoint.pth 등)')
+    args = parser.parse_args()
+
     # 재현성을 위한 random seed 고정
     seed = CFG['seed']
     random.seed(seed)
@@ -322,11 +328,28 @@ def main():
                             lr=CFG['lr'], weight_decay=CFG['weight_decay'])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG['epochs'])
 
+    # ── Resume ────────────────────────────────────────────────────────────────
+    start_epoch = 1
+    best_val    = float('inf')
+
+    if args.resume:
+        ckpt_path = Path(args.resume)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Resume 체크포인트를 찾을 수 없습니다: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt['state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        start_epoch = ckpt['epoch'] + 1
+        best_val    = ckpt.get('best_val', float('inf'))
+        print(f"Resume: epoch {ckpt['epoch']} → {start_epoch}부터 재개  "
+              f"(best_val={best_val:.4f}  lr={scheduler.get_last_lr()[0]:.2e})")
+    # ─────────────────────────────────────────────────────────────────────────
+
     print("\n학습 시작...")
-    best_val = float('inf')
 
     # 전체 에폭 progress bar
-    epoch_bar = tqdm(range(1, CFG['epochs'] + 1),
+    epoch_bar = tqdm(range(start_epoch, CFG['epochs'] + 1),
                      desc='Epochs', unit='ep', dynamic_ncols=True)
 
     for epoch in epoch_bar:
@@ -380,14 +403,23 @@ def main():
             f"{marker}"
         )
 
+        # 매 에폭: 재개용 last checkpoint 저장 (optimizer/scheduler 포함)
+        last_ckpt = {
+            'epoch'                : epoch,
+            'state_dict'           : model.state_dict(),
+            'optimizer_state_dict' : optimizer.state_dict(),
+            'scheduler_state_dict' : scheduler.state_dict(),
+            'best_val'             : best_val,
+            'val_loss'             : val_log,
+            'cfg'                  : CFG,
+        }
+        torch.save(last_ckpt, Path(CFG['checkpoint_dir']) / 'last_checkpoint.pth')
+
         if is_best:
             best_val = val_log['total']
-            torch.save({
-                'epoch'     : epoch,
-                'state_dict': model.state_dict(),
-                'val_loss'  : val_log,
-                'cfg'       : CFG,
-            }, Path(CFG['checkpoint_dir']) / 'best_skin_analyzer.pth')
+            last_ckpt['best_val'] = best_val          # 갱신된 값 반영
+            torch.save(last_ckpt,
+                       Path(CFG['checkpoint_dir']) / 'best_skin_analyzer.pth')
             tqdm.write(f"  ★ Best 저장: val={best_val:.4f}")
 
         # 학습 제외 이미지 예측 결과 시각화
