@@ -144,7 +144,6 @@ class SkinDataset(Dataset):
                   f"→ GT 파일 직접 계산 후 manifest.json 에 저장")
 
         weights = []
-        updated = False
         iter_stems = tqdm(self.stems, desc='pos_ratio 계산 중', leave=False) \
             if missing else self.stems
 
@@ -161,15 +160,14 @@ class SkinDataset(Dataset):
                     if gt_path.exists():
                         arr = np.array(Image.open(gt_path).convert('L'))
                         r = round(float((arr > 127).sum()) / arr.size, 6)
-                        info[ratio_key] = r          # manifest 인메모리 업데이트
+                        self.manifest[stem][ratio_key] = r   # 직접 접근으로 확실히 업데이트
                         max_ratio = max(max_ratio, r)
-                        updated = True
 
             w = math.sqrt(max_ratio) if max_ratio > 0 else neg_weight
             weights.append(w)
 
-        # 계산한 pos_ratio를 manifest.json에 write-back → 다음 실행 즉시 반환
-        if updated:
+        # missing이 있었으면 무조건 write-back (updated 플래그 불필요)
+        if missing:
             manifest_path = self.patch_dir / 'manifest.json'
             with open(manifest_path, 'w', encoding='utf-8') as f:
                 json.dump(self.manifest, f, indent=2, ensure_ascii=False)
