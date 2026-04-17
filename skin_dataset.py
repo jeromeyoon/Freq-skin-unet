@@ -123,26 +123,30 @@ class SkinDataset(Dataset):
         """
         샘플별 WeightedRandomSampler 가중치 반환.
 
-        양성 픽셀이 많은 패치를 오버샘플링하여 클래스 불균형 완화.
-        wrinkle처럼 선 형태로 양성 비율이 낮아도 의미 있는 패치를 보정.
+        결과는 {patch_dir}/sample_weights.json 에 캐시.
+        stems 목록이 바뀌지 않으면 다음 실행부터 즉시 로드.
 
         weight = sqrt(max_pos_ratio)  — 양성 픽셀 있음
         weight = neg_weight           — 모든 GT가 전부 검은색 (양성 0%)
-
-        neg_weight : 양성 픽셀 없는 패치의 최소 가중치 (기본 0.05)
-                     0으로 하면 완전 배제, 너무 낮으면 false-positive 증가 위험
         """
-        weights = []
-        need_file_read = any(
-            f'{task}_pos_ratio' not in self.manifest.get(stem, {})
-            for stem in self.stems
-            for task in ('brown', 'red', 'wrinkle')
-            if self.manifest.get(stem, {}).get(f'has_{task}', False)
-        )
-        iter_stems = tqdm(self.stems, desc='가중치 계산 중', leave=False) \
-            if need_file_read else self.stems
+        cache_path = self.patch_dir / 'sample_weights.json'
 
-        for stem in iter_stems:
+        # ── 캐시 로드 시도 ───────────────────────────────────────────────────
+        if cache_path.exists():
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                cache = json.load(f)
+            # stems 순서·내용이 동일하고 neg_weight도 같으면 재사용
+            if (cache.get('stems') == self.stems
+                    and cache.get('neg_weight') == neg_weight):
+                weights = cache['weights']
+                pos = sum(1 for w in weights if w > neg_weight)
+                print(f"[SkinDataset] WeightedSampler 캐시 로드: "
+                      f"양성 패치={pos}/{len(weights)}, neg_weight={neg_weight}")
+                return weights
+
+        # ── 캐시 없음 또는 무효 → 직접 계산 ──────────────────────────────────
+        weights = []
+        for stem in tqdm(self.stems, desc='샘플 가중치 계산 중', leave=False):
             info = self.manifest[stem]
             max_ratio = 0.0
 
@@ -151,8 +155,6 @@ class SkinDataset(Dataset):
                 if ratio_key in info:
                     max_ratio = max(max_ratio, info[ratio_key])
                 elif info.get(f'has_{task}', False):
-                    # manifest에 pos_ratio 없음 → GT 파일 직접 읽어 계산
-                    # (data_prep.py 재실행 후에는 manifest에 저장돼 이 경로 불필요)
                     gt_path = self.patch_dir / task / f'{stem}.png'
                     if gt_path.exists():
                         arr = np.array(Image.open(gt_path).convert('L'))
@@ -162,9 +164,14 @@ class SkinDataset(Dataset):
             w = math.sqrt(max_ratio) if max_ratio > 0 else neg_weight
             weights.append(w)
 
+        # ── 캐시 저장 ────────────────────────────────────────────────────────
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump({'stems': self.stems, 'neg_weight': neg_weight,
+                       'weights': weights}, f)
+
         pos = sum(1 for w in weights if w > neg_weight)
-        print(f"[SkinDataset] WeightedSampler: 양성 패치={pos}/{len(weights)}, "
-              f"neg_weight={neg_weight}")
+        print(f"[SkinDataset] WeightedSampler 계산 완료: "
+              f"양성 패치={pos}/{len(weights)}, neg_weight={neg_weight}")
         return weights
 
     def _apply_augment(self, *tensors):
