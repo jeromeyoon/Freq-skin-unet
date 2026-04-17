@@ -67,7 +67,7 @@ CFG = dict(
     pos_weight_red    = 10.0,
 
     # 조명 aug warm-up: 처음 N epoch은 aug 강도를 낮게 시작 (0이면 비활성)
-    aug_warmup_epochs = 10,
+    aug_warmup_epochs = 30,
 
     # GT 픽셀 비율 기반 가중치 샘플링 (클래스 불균형 완화)
     # neg_weight: 양성 픽셀 없는 패치의 최소 샘플링 가중치 (0.05 = 양성 패치의 5% 확률)
@@ -373,8 +373,6 @@ def main():
         w_recon    = CFG['w_recon'],
         w_consist  = CFG['w_consist'],
         w_freq_reg = CFG['w_freq_reg'],
-        pos_weight_brown = CFG['pos_weight_brown'],
-        pos_weight_red   = CFG['pos_weight_red'],
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(),
