@@ -124,12 +124,12 @@ class SkinDataset(Dataset):
         샘플별 WeightedRandomSampler 가중치 반환.
 
         manifest.json에 {task}_pos_ratio가 있으면 파일 I/O 없이 즉시 계산.
-        없는 경우(구버전 manifest)에만 GT 파일을 직접 읽어 보완.
+        없는 경우(구버전 manifest)에만 GT 파일을 직접 읽어 보완하고
+        결과를 manifest.json에 저장 → 다음 실행부터 즉시 반환.
 
         weight = sqrt(max_pos_ratio)  — 양성 픽셀 있음
         weight = neg_weight           — 모든 GT가 전부 검은색 (양성 0%)
         """
-        # manifest에 pos_ratio가 없는 stem이 있는지 확인
         missing = [
             stem for stem in self.stems
             if any(
@@ -140,11 +140,12 @@ class SkinDataset(Dataset):
         ]
 
         if missing:
-            print(f"[SkinDataset] manifest에 pos_ratio 없는 패치 {len(missing)}개 "
-                  f"→ GT 파일 직접 계산 (data_prep.py 재실행 시 해소)")
+            print(f"[SkinDataset] pos_ratio 없는 패치 {len(missing)}개 "
+                  f"→ GT 파일 직접 계산 후 manifest.json 에 저장")
 
         weights = []
-        iter_stems = tqdm(self.stems, desc='가중치 계산 중', leave=False) \
+        updated = False
+        iter_stems = tqdm(self.stems, desc='pos_ratio 계산 중', leave=False) \
             if missing else self.stems
 
         for stem in iter_stems:
@@ -159,11 +160,20 @@ class SkinDataset(Dataset):
                     gt_path = self.patch_dir / task / f'{stem}.png'
                     if gt_path.exists():
                         arr = np.array(Image.open(gt_path).convert('L'))
-                        r = float((arr > 127).sum()) / arr.size
+                        r = round(float((arr > 127).sum()) / arr.size, 6)
+                        info[ratio_key] = r          # manifest 인메모리 업데이트
                         max_ratio = max(max_ratio, r)
+                        updated = True
 
             w = math.sqrt(max_ratio) if max_ratio > 0 else neg_weight
             weights.append(w)
+
+        # 계산한 pos_ratio를 manifest.json에 write-back → 다음 실행 즉시 반환
+        if updated:
+            manifest_path = self.patch_dir / 'manifest.json'
+            with open(manifest_path, 'w', encoding='utf-8') as f:
+                json.dump(self.manifest, f, indent=2, ensure_ascii=False)
+            print(f"[SkinDataset] manifest.json 업데이트 완료 → 다음 실행부터 즉시 반환")
 
         pos = sum(1 for w in weights if w > neg_weight)
         print(f"[SkinDataset] WeightedSampler: "
