@@ -34,9 +34,11 @@ __getitem__ 반환
 """
 
 import json
+import math
 import random
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
@@ -115,6 +117,47 @@ class SkinDataset(Dataset):
 
     def __len__(self):
         return len(self.stems)
+
+    def get_sample_weights(self, neg_weight: float = 0.05) -> list[float]:
+        """
+        샘플별 WeightedRandomSampler 가중치 반환.
+
+        양성 픽셀이 많은 패치를 오버샘플링하여 클래스 불균형 완화.
+        wrinkle처럼 선 형태로 양성 비율이 낮아도 의미 있는 패치를 보정.
+
+        weight = sqrt(max_pos_ratio)  — 양성 픽셀 있음
+        weight = neg_weight           — 모든 GT가 전부 검은색 (양성 0%)
+
+        neg_weight : 양성 픽셀 없는 패치의 최소 가중치 (기본 0.05)
+                     0으로 하면 완전 배제, 너무 낮으면 false-positive 증가 위험
+        """
+        weights = []
+        for stem in self.stems:
+            info = self.manifest[stem]
+            max_ratio = 0.0
+
+            for task in ('brown', 'red', 'wrinkle'):
+                ratio_key = f'{task}_pos_ratio'
+                if ratio_key in info:
+                    # manifest에 저장된 값 사용 (data_prep.py 재실행 후)
+                    max_ratio = max(max_ratio, info[ratio_key])
+                elif info.get(f'has_{task}', False):
+                    # manifest에 없으면 파일에서 직접 계산 (구버전 manifest 호환)
+                    gt_path = self.patch_dir / task / f'{stem}.png'
+                    if gt_path.exists():
+                        arr = np.array(Image.open(gt_path).convert('L'))
+                        r = float((arr > 127).sum()) / arr.size
+                        max_ratio = max(max_ratio, r)
+                        # 다음 호출 때 재계산하지 않도록 manifest 캐시
+                        info[ratio_key] = round(r, 6)
+
+            w = math.sqrt(max_ratio) if max_ratio > 0 else neg_weight
+            weights.append(w)
+
+        pos = sum(1 for w in weights if w > neg_weight)
+        print(f"[SkinDataset] WeightedSampler: 양성 패치={pos}/{len(weights)}, "
+              f"neg_weight={neg_weight}")
+        return weights
 
     def _apply_augment(self, *tensors):
         """동일한 geometric augment를 모든 텐서에 적용 (None 안전)"""

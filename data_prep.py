@@ -407,11 +407,15 @@ def prepare(input_path:       str,
             bgr2rgb_pil(p_p).save(out_root / 'rgb_parallel' / f'{stem}.png')
             Image.fromarray(m_p, mode='L').save(out_root / 'mask' / f'{stem}.png')
 
+            gt_pos_ratios = {}
             for task in ['brown', 'red', 'wrinkle']:
                 if task in gt_arrays:
                     gt_p_arr = crop_patch(gt_arrays[task], y, x, patch_size)
                     Image.fromarray(gt_p_arr, mode='L').save(
                         out_root / task / f'{stem}.png')
+                    # 양성 픽셀 비율 기록 (흰색 > 127 기준)
+                    pos_ratio = float((gt_p_arr > 127).sum()) / gt_p_arr.size
+                    gt_pos_ratios[f'{task}_pos_ratio'] = round(pos_ratio, 6)
 
             manifest[stem] = {
                 'subject_name': subject_name,
@@ -420,6 +424,7 @@ def prepare(input_path:       str,
                 'has_brown'   : has_gt['brown'],
                 'has_red'     : has_gt['red'],
                 'has_wrinkle' : has_gt['wrinkle'],
+                **gt_pos_ratios,
             }
             saved         += 1
             total_patches += 1

@@ -21,7 +21,7 @@ import random
 import numpy as np
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, WeightedRandomSampler, random_split
 from pathlib import Path
 
 import torchvision.utils as vutils
@@ -67,6 +67,11 @@ CFG = dict(
 
     # 조명 aug warm-up: 처음 N epoch은 aug 강도를 낮게 시작 (0이면 비활성)
     aug_warmup_epochs = 10,
+
+    # GT 픽셀 비율 기반 가중치 샘플링 (클래스 불균형 완화)
+    # neg_weight: 양성 픽셀 없는 패치의 최소 샘플링 가중치 (0.05 = 양성 패치의 5% 확률)
+    use_weighted_sampler = True,
+    sampler_neg_weight   = 0.05,
 
     # 실내 조명 특화 augmentation 파라미터
     intensity_range   = (0.6, 1.4),   # 실내: 극단적 밝기 변화 없음 (0.5~1.8 → 좁힘)
@@ -303,11 +308,28 @@ def main():
     train_ds, val_ds = random_split(full_ds, [len(full_ds) - val_size, val_size])
     val_ds.dataset.augment = False
 
-    train_loader = DataLoader(
-        train_ds, CFG['batch_size'], shuffle=True,
-        num_workers=CFG['num_workers'], pin_memory=True,
-        collate_fn=skin_collate_fn,
-    )
+    # GT 픽셀 비율 기반 WeightedRandomSampler (shuffle=False, sampler가 순서 담당)
+    if CFG.get('use_weighted_sampler', False):
+        # train_ds는 Subset이므로 원본 dataset에서 인덱스로 가중치 추출
+        all_weights = full_ds.get_sample_weights(
+            neg_weight=CFG.get('sampler_neg_weight', 0.05))
+        train_weights = [all_weights[i] for i in train_ds.indices]
+        sampler = WeightedRandomSampler(
+            weights     = train_weights,
+            num_samples = len(train_weights),
+            replacement = True,
+        )
+        train_loader = DataLoader(
+            train_ds, CFG['batch_size'], sampler=sampler,
+            num_workers=CFG['num_workers'], pin_memory=True,
+            collate_fn=skin_collate_fn,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, CFG['batch_size'], shuffle=True,
+            num_workers=CFG['num_workers'], pin_memory=True,
+            collate_fn=skin_collate_fn,
+        )
     val_loader = DataLoader(
         val_ds, CFG['batch_size'], shuffle=False,
         num_workers=CFG['num_workers'], pin_memory=True,
