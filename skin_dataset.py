@@ -43,6 +43,7 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
 from PIL import Image
+from tqdm import tqdm
 
 
 # ── 모듈 레벨 이미지 로더 (두 Dataset 클래스에서 공유) ────────────────────────
@@ -132,24 +133,31 @@ class SkinDataset(Dataset):
                      0으로 하면 완전 배제, 너무 낮으면 false-positive 증가 위험
         """
         weights = []
-        for stem in self.stems:
+        need_file_read = any(
+            f'{task}_pos_ratio' not in self.manifest.get(stem, {})
+            for stem in self.stems
+            for task in ('brown', 'red', 'wrinkle')
+            if self.manifest.get(stem, {}).get(f'has_{task}', False)
+        )
+        iter_stems = tqdm(self.stems, desc='가중치 계산 중', leave=False) \
+            if need_file_read else self.stems
+
+        for stem in iter_stems:
             info = self.manifest[stem]
             max_ratio = 0.0
 
             for task in ('brown', 'red', 'wrinkle'):
                 ratio_key = f'{task}_pos_ratio'
                 if ratio_key in info:
-                    # manifest에 저장된 값 사용 (data_prep.py 재실행 후)
                     max_ratio = max(max_ratio, info[ratio_key])
                 elif info.get(f'has_{task}', False):
-                    # manifest에 없으면 파일에서 직접 계산 (구버전 manifest 호환)
+                    # manifest에 pos_ratio 없음 → GT 파일 직접 읽어 계산
+                    # (data_prep.py 재실행 후에는 manifest에 저장돼 이 경로 불필요)
                     gt_path = self.patch_dir / task / f'{stem}.png'
                     if gt_path.exists():
                         arr = np.array(Image.open(gt_path).convert('L'))
                         r = float((arr > 127).sum()) / arr.size
                         max_ratio = max(max_ratio, r)
-                        # 다음 호출 때 재계산하지 않도록 manifest 캐시
-                        info[ratio_key] = round(r, 6)
 
             w = math.sqrt(max_ratio) if max_ratio > 0 else neg_weight
             weights.append(w)

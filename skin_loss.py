@@ -123,8 +123,8 @@ class SkinAnalyzerLoss(nn.Module):
         self.focal_alpha  = focal_alpha
 
         # 양성 클래스 가중치 버퍼 (device 자동 이동)
-        self.register_buffer('pw_brown', torch.tensor([pos_weight_brown]))
-        self.register_buffer('pw_red',   torch.tensor([pos_weight_red]))
+        self.register_buffer('pw_brown', torch.tensor(pos_weight_brown))
+        self.register_buffer('pw_red',   torch.tensor(pos_weight_red))
 
         self.register_buffer('mel_abs',
                              torch.tensor(self._MEL_ABS).view(1, 3, 1, 1))
@@ -354,7 +354,7 @@ def get_loss_weights(epoch:        int,
 
     # Phase 0 (0~20%): supervised only — recon off
     # 마스크가 아직 부정확한 초반에 Beer-Lambert recon이 gradient를 왜곡하는 것을 방지
-    if progress < 0.2:
+    if progress <= 0.2:
         return {**base, 'w_recon': 0.0}
     # Phase 1 (20~40%): supervised + recon
     if progress < 0.4:

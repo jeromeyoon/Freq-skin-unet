@@ -51,7 +51,7 @@ CFG = dict(
     batch_size     = 16,
     lr             = 1e-4,
     weight_decay   = 1e-4,
-    num_workers    = 4,
+    num_workers    = 2,   # 동시 학습 시 worker 충돌 방지 (단독 실행 시 4로 늘려도 됨)
     val_ratio      = 0.1,
 
     w_brown        = 1.0,
@@ -328,17 +328,20 @@ def main():
         train_loader = DataLoader(
             train_ds, CFG['batch_size'], sampler=sampler,
             num_workers=CFG['num_workers'], pin_memory=True,
+            persistent_workers=CFG['num_workers'] > 0,
             collate_fn=skin_collate_fn,
         )
     else:
         train_loader = DataLoader(
             train_ds, CFG['batch_size'], shuffle=True,
             num_workers=CFG['num_workers'], pin_memory=True,
+            persistent_workers=CFG['num_workers'] > 0,
             collate_fn=skin_collate_fn,
         )
     val_loader = DataLoader(
         val_ds, CFG['batch_size'], shuffle=False,
         num_workers=CFG['num_workers'], pin_memory=True,
+        persistent_workers=CFG['num_workers'] > 0,
         collate_fn=skin_collate_fn,
     )
     print(f"Train: {len(train_ds)} / Val: {len(val_ds)}")
