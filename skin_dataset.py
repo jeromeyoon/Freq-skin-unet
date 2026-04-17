@@ -123,30 +123,31 @@ class SkinDataset(Dataset):
         """
         샘플별 WeightedRandomSampler 가중치 반환.
 
-        결과는 {patch_dir}/sample_weights.json 에 캐시.
-        stems 목록이 바뀌지 않으면 다음 실행부터 즉시 로드.
+        manifest.json에 {task}_pos_ratio가 있으면 파일 I/O 없이 즉시 계산.
+        없는 경우(구버전 manifest)에만 GT 파일을 직접 읽어 보완.
 
         weight = sqrt(max_pos_ratio)  — 양성 픽셀 있음
         weight = neg_weight           — 모든 GT가 전부 검은색 (양성 0%)
         """
-        cache_path = self.patch_dir / 'sample_weights.json'
+        # manifest에 pos_ratio가 없는 stem이 있는지 확인
+        missing = [
+            stem for stem in self.stems
+            if any(
+                self.manifest[stem].get(f'has_{task}', False)
+                and f'{task}_pos_ratio' not in self.manifest[stem]
+                for task in ('brown', 'red', 'wrinkle')
+            )
+        ]
 
-        # ── 캐시 로드 시도 ───────────────────────────────────────────────────
-        if cache_path.exists():
-            with open(cache_path, 'r', encoding='utf-8') as f:
-                cache = json.load(f)
-            # stems 순서·내용이 동일하고 neg_weight도 같으면 재사용
-            if (cache.get('stems') == self.stems
-                    and cache.get('neg_weight') == neg_weight):
-                weights = cache['weights']
-                pos = sum(1 for w in weights if w > neg_weight)
-                print(f"[SkinDataset] WeightedSampler 캐시 로드: "
-                      f"양성 패치={pos}/{len(weights)}, neg_weight={neg_weight}")
-                return weights
+        if missing:
+            print(f"[SkinDataset] manifest에 pos_ratio 없는 패치 {len(missing)}개 "
+                  f"→ GT 파일 직접 계산 (data_prep.py 재실행 시 해소)")
 
-        # ── 캐시 없음 또는 무효 → 직접 계산 ──────────────────────────────────
         weights = []
-        for stem in tqdm(self.stems, desc='샘플 가중치 계산 중', leave=False):
+        iter_stems = tqdm(self.stems, desc='가중치 계산 중', leave=False) \
+            if missing else self.stems
+
+        for stem in iter_stems:
             info = self.manifest[stem]
             max_ratio = 0.0
 
@@ -164,13 +165,8 @@ class SkinDataset(Dataset):
             w = math.sqrt(max_ratio) if max_ratio > 0 else neg_weight
             weights.append(w)
 
-        # ── 캐시 저장 ────────────────────────────────────────────────────────
-        with open(cache_path, 'w', encoding='utf-8') as f:
-            json.dump({'stems': self.stems, 'neg_weight': neg_weight,
-                       'weights': weights}, f)
-
         pos = sum(1 for w in weights if w > neg_weight)
-        print(f"[SkinDataset] WeightedSampler 계산 완료: "
+        print(f"[SkinDataset] WeightedSampler: "
               f"양성 패치={pos}/{len(weights)}, neg_weight={neg_weight}")
         return weights
 
