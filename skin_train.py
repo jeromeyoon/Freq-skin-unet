@@ -17,6 +17,7 @@ SkinAnalyzer 듀얼 편광 + 부분 GT 학습 스크립트
 """
 
 import argparse
+import copy
 import random
 import numpy as np
 import torch
@@ -306,6 +307,11 @@ def main():
     full_ds  = SkinDataset(CFG['patch_dir'], CFG['img_size'], augment=True)
     val_size = max(1, int(len(full_ds) * CFG['val_ratio']))
     train_ds, val_ds = random_split(full_ds, [len(full_ds) - val_size, val_size])
+
+    # val용 dataset을 별도 복사해서 augment 비활성화
+    # (train_ds.dataset과 val_ds.dataset이 같은 full_ds를 공유하므로
+    #  단순 augment=False 설정 시 train도 함께 꺼짐)
+    val_ds.dataset = copy.copy(full_ds)
     val_ds.dataset.augment = False
 
     # GT 픽셀 비율 기반 WeightedRandomSampler (shuffle=False, sampler가 순서 담당)
