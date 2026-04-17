@@ -60,6 +60,14 @@ CFG = dict(
     w_consist      = 0.0,
     w_freq_reg     = 0.0,
 
+    # sparse lesion 양성 클래스 불균형 보정 (brown/red spot 픽셀 비율이 매우 낮음)
+    # 데이터에서 background:lesion 비율을 측정해 조정 권장 (일반적으로 5~20)
+    pos_weight_brown  = 10.0,
+    pos_weight_red    = 10.0,
+
+    # 조명 aug warm-up: 처음 N epoch은 aug 강도를 낮게 시작 (0이면 비활성)
+    aug_warmup_epochs = 10,
+
     # 실내 조명 특화 augmentation 파라미터
     intensity_range   = (0.6, 1.4),   # 실내: 극단적 밝기 변화 없음 (0.5~1.8 → 좁힘)
     color_temp_range  = (0.7, 1.3),   # 백열(warm) ↔ 형광/LED(cool) 범위
@@ -139,12 +147,21 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg, epoch, tot
     total_loss = 0.0
     log = {k: 0.0 for k in ['brown', 'red', 'wrinkle', 'recon', 'consist', 'freq_reg']}
 
+    # warm-up 기간 동안 aug 강도를 선형으로 증가 (0→full)
+    warmup = cfg.get('aug_warmup_epochs', 0)
+    aug_scale = min(1.0, epoch / max(warmup, 1)) if warmup > 0 else 1.0
+
+    def _scale_range(rng, scale):
+        mid = (rng[0] + rng[1]) / 2.0
+        half = (rng[1] - rng[0]) / 2.0 * scale
+        return (mid - half, mid + half)
+
     aug_kwargs = dict(
-        intensity_range  = cfg['intensity_range'],
-        color_temp_range = cfg['color_temp_range'],
-        tint_range       = cfg['tint_range'],
-        vignette_prob    = cfg['vignette_prob'],
-        gradient_prob    = cfg['gradient_prob'],
+        intensity_range  = _scale_range(cfg['intensity_range'],  aug_scale),
+        color_temp_range = _scale_range(cfg['color_temp_range'], aug_scale),
+        tint_range       = _scale_range(cfg['tint_range'],       aug_scale),
+        vignette_prob    = cfg['vignette_prob']  * aug_scale,
+        gradient_prob    = cfg['gradient_prob']  * aug_scale,
     )
 
     pbar = tqdm(loader,
@@ -322,6 +339,8 @@ def main():
         w_recon    = CFG['w_recon'],
         w_consist  = CFG['w_consist'],
         w_freq_reg = CFG['w_freq_reg'],
+        pos_weight_brown = CFG['pos_weight_brown'],
+        pos_weight_red   = CFG['pos_weight_red'],
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(),

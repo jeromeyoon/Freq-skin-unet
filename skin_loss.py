@@ -61,11 +61,14 @@ def _dice_loss_per_sample(pred:      torch.Tensor,
 
 def _bce_per_pixel(pred:      torch.Tensor,
                    gt:        torch.Tensor,
-                   face_mask: torch.Tensor) -> torch.Tensor:
+                   face_mask: torch.Tensor,
+                   pos_weight: torch.Tensor | None = None) -> torch.Tensor:
     """BCE를 피부 영역에만 적용. [B,1,H,W] 반환.
-    pred : logit (binary_cross_entropy_with_logits 사용 → 수치 안정)
+    pred       : logit (binary_cross_entropy_with_logits 사용 → 수치 안정)
+    pos_weight : 양성 클래스 가중치 스칼라 텐서 — sparse lesion 불균형 보정
     """
-    bce = F.binary_cross_entropy_with_logits(pred, gt, reduction='none')
+    bce = F.binary_cross_entropy_with_logits(
+        pred, gt, pos_weight=pos_weight, reduction='none')
     return bce * face_mask             # [B,1,H,W]
 
 
@@ -103,9 +106,11 @@ class SkinAnalyzerLoss(nn.Module):
                  w_recon:      float = 0.3,
                  w_consist:    float = 0.0,
                  w_freq_reg:   float = 0.0,
-                 bce_dice_ratio: float = 0.5,   # BCE:Dice 비율 (brown/red)
+                 bce_dice_ratio: float = 0.3,   # BCE:Dice 비율 (brown/red) — Dice 70%로 상향
                  focal_gamma:  float = 2.0,
-                 focal_alpha:  float = 0.25):
+                 focal_alpha:  float = 0.25,
+                 pos_weight_brown:  float = 10.0,  # brown sparse lesion 양성 클래스 가중치
+                 pos_weight_red:    float = 10.0): # red sparse lesion 양성 클래스 가중치
         super().__init__()
         self.w_brown      = w_brown
         self.w_red        = w_red
@@ -117,6 +122,10 @@ class SkinAnalyzerLoss(nn.Module):
         self.focal_gamma  = focal_gamma
         self.focal_alpha  = focal_alpha
 
+        # 양성 클래스 가중치 버퍼 (device 자동 이동)
+        self.register_buffer('pw_brown', torch.tensor([pos_weight_brown]))
+        self.register_buffer('pw_red',   torch.tensor([pos_weight_red]))
+
         self.register_buffer('mel_abs',
                              torch.tensor(self._MEL_ABS).view(1, 3, 1, 1))
         self.register_buffer('hem_abs',
@@ -124,21 +133,23 @@ class SkinAnalyzerLoss(nn.Module):
 
     # ── brown / red : BCE + Dice ─────────────────────────────────────────────
     def _bce_dice(self,
-                  pred:      torch.Tensor,
-                  gt:        torch.Tensor,
-                  face_mask: torch.Tensor,
-                  has_gt:    list[bool]) -> torch.Tensor:
+                  pred:       torch.Tensor,
+                  gt:         torch.Tensor,
+                  face_mask:  torch.Tensor,
+                  has_gt:     list[bool],
+                  pos_weight: torch.Tensor | None = None) -> torch.Tensor:
         """
         BCE + Dice (부분 GT 지원)
 
         pred / gt / face_mask : [B,1,H,W]
         has_gt                : list[bool] 길이 B
+        pos_weight            : 양성 클래스 가중치 (sparse lesion 불균형 보정)
         """
         gt_avail = torch.tensor(has_gt, dtype=torch.float32,
                                 device=pred.device).view(-1, 1, 1, 1)
 
         # ── BCE ───────────────────────────────────────────────────────────────
-        bce_map = _bce_per_pixel(pred, gt, face_mask)              # [B,1,H,W]
+        bce_map = _bce_per_pixel(pred, gt, face_mask, pos_weight)  # [B,1,H,W]
         bce_map = bce_map * gt_avail
         denom_pix = (face_mask * gt_avail).sum().clamp(min=1.0)
         l_bce = bce_map.sum() / denom_pix
@@ -258,11 +269,13 @@ class SkinAnalyzerLoss(nn.Module):
         detail = {}
 
         # ── Supervised (부분) ────────────────────────────────────────────────
-        # brown / red : BCE + Dice
+        # brown / red : BCE + Dice  (pos_weight로 sparse lesion 불균형 보정)
         l_brown = self._bce_dice(
-            result.brown_mask,   brown_gt,   face_mask, has_brown)
+            result.brown_mask,   brown_gt,   face_mask, has_brown,
+            pos_weight=self.pw_brown)
         l_red = self._bce_dice(
-            result.red_mask,     red_gt,     face_mask, has_red)
+            result.red_mask,     red_gt,     face_mask, has_red,
+            pos_weight=self.pw_red)
         # wrinkle : Focal + Dice
         l_wrinkle = self._focal_dice(
             result.wrinkle_mask, wrinkle_gt, face_mask, has_wrinkle)
@@ -338,8 +351,16 @@ def get_loss_weights(epoch:        int,
     progress = epoch / total_epochs
     base = dict(w_brown=w_brown, w_red=w_red, w_wrinkle=w_wrinkle,
                 w_recon=w_recon, w_consist=0.0, w_freq_reg=0.0)
+
+    # Phase 0 (0~20%): supervised only — recon off
+    # 마스크가 아직 부정확한 초반에 Beer-Lambert recon이 gradient를 왜곡하는 것을 방지
+    if progress < 0.2:
+        return {**base, 'w_recon': 0.0}
+    # Phase 1 (20~40%): supervised + recon
     if progress < 0.4:
         return base
+    # Phase 2 (40~80%): + consistency
     if progress < 0.8:
         return {**base, 'w_consist': 0.3}
+    # Phase 3 (80~100%): + freq_reg
     return {**base, 'w_consist': 0.3, 'w_freq_reg': 0.1}
