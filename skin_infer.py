@@ -463,7 +463,7 @@ class InferDataset(torch.utils.data.Dataset):
         for tag in ('brown', 'red', 'wrinkle'):
             gt_path = self.input_dir / f'gt_{tag}' / f'{stem}.png'
             if gt_path.exists():
-                item[f'gt_{tag}']     = load_gray(gt_path, self.img_size)
+                item[f'gt_{tag}']     = load_gray_full(gt_path)
                 item[f'has_gt_{tag}'] = True
             else:
                 item[f'gt_{tag}']     = torch.zeros(1, self.img_size, self.img_size)

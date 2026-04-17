@@ -329,6 +329,7 @@ def main():
             train_ds, CFG['batch_size'], sampler=sampler,
             num_workers=CFG['num_workers'], pin_memory=True,
             persistent_workers=CFG['num_workers'] > 0,
+            prefetch_factor=4 if CFG['num_workers'] > 0 else None,
             collate_fn=skin_collate_fn,
         )
     else:
@@ -336,12 +337,14 @@ def main():
             train_ds, CFG['batch_size'], shuffle=True,
             num_workers=CFG['num_workers'], pin_memory=True,
             persistent_workers=CFG['num_workers'] > 0,
+            prefetch_factor=4 if CFG['num_workers'] > 0 else None,
             collate_fn=skin_collate_fn,
         )
     val_loader = DataLoader(
         val_ds, CFG['batch_size'], shuffle=False,
         num_workers=CFG['num_workers'], pin_memory=True,
         persistent_workers=CFG['num_workers'] > 0,
+        prefetch_factor=4 if CFG['num_workers'] > 0 else None,
         collate_fn=skin_collate_fn,
     )
     print(f"Train: {len(train_ds)} / Val: {len(val_ds)}")

@@ -305,13 +305,15 @@ class SkinAnalyzerLoss(nn.Module):
         # result(원본)을 pred로, result_aug(증강)을 pseudo-GT로 사용.
         # result_aug는 grad 있음, result는 detach → 원본 예측을 기준점으로 고정.
         if self.w_consist > 0 and result_aug is not None:
+            # result(증강 입력 예측)이 result_aug(원본 입력 예측, stop-grad)에 가까워지도록.
+            # 증강 예측의 gradient만 흘려야 조명 불변성이 학습됨.
             l_consist = (
-                self._partial_l1(result_aug.brown_mask,
-                                 result.brown_mask.detach(),   face_mask, has_brown) +
-                self._partial_l1(result_aug.red_mask,
-                                 result.red_mask.detach(),     face_mask, has_red)   +
-                self._partial_l1(result_aug.wrinkle_mask,
-                                 result.wrinkle_mask.detach(), face_mask, has_wrinkle)
+                self._partial_l1(result.brown_mask,
+                                 result_aug.brown_mask.detach(),   face_mask, has_brown) +
+                self._partial_l1(result.red_mask,
+                                 result_aug.red_mask.detach(),     face_mask, has_red)   +
+                self._partial_l1(result.wrinkle_mask,
+                                 result_aug.wrinkle_mask.detach(), face_mask, has_wrinkle)
             ) / 3.0
             detail['consist'] = l_consist.item()
             loss = loss + self.w_consist * l_consist
