@@ -60,6 +60,10 @@ CFG = dict(
     w_recon        = 0.3,
     w_consist      = 0.0,
     w_freq_reg     = 0.0,
+    dice_threshold = 0.5,
+    best_w_brown   = 1.0,
+    best_w_red     = 1.0,
+    best_w_wrinkle = 1.2,
 
     # sparse lesion 양성 클래스 불균형 보정 (brown/red spot 픽셀 비율이 매우 낮음)
     # 데이터에서 background:lesion 비율을 측정해 조정 권장 (일반적으로 5~20)
@@ -148,6 +152,49 @@ def save_preview(model, preview_loader, device, epoch, save_dir: Path, n_images:
 # ══════════════════════════════════════════════════════════════════════════════
 # 학습
 # ══════════════════════════════════════════════════════════════════════════════
+@torch.no_grad()
+def _dice_sum_and_count(pred_logit: torch.Tensor,
+                        gt:         torch.Tensor,
+                        face_mask:  torch.Tensor,
+                        has_gt:     list[bool],
+                        threshold:  float = 0.5,
+                        eps:        float = 1e-6) -> tuple[float, int]:
+    """
+    부분 GT 지원 Dice metric.
+
+    - sigmoid + threshold 후 binary mask 기준으로 계산
+    - GT가 존재하는 샘플(has_gt=True)만 평균
+    - face_mask 내부 픽셀만 평가
+    """
+    valid = torch.tensor(has_gt, dtype=torch.bool, device=pred_logit.device)
+    n_valid = int(valid.sum().item())
+    if n_valid == 0:
+        return 0.0, 0
+
+    pred_bin = (torch.sigmoid(pred_logit) >= threshold).float() * face_mask
+    gt_bin   = (gt >= 0.5).float() * face_mask
+
+    pred_flat = pred_bin[valid].flatten(1)
+    gt_flat   = gt_bin[valid].flatten(1)
+
+    inter = (pred_flat * gt_flat).sum(dim=1)
+    denom = pred_flat.sum(dim=1) + gt_flat.sum(dim=1)
+    dice  = (2.0 * inter + eps) / (denom + eps)
+    return float(dice.sum().item()), n_valid
+
+
+def _weighted_best_score(val_log: dict, cfg: dict) -> float:
+    wb = cfg.get('best_w_brown', 1.0)
+    wr = cfg.get('best_w_red', 1.0)
+    ww = cfg.get('best_w_wrinkle', 1.0)
+    denom = wb + wr + ww
+    return (
+        wb * val_log.get('brown_dice', 0.0) +
+        wr * val_log.get('red_dice', 0.0) +
+        ww * val_log.get('wrinkle_dice', 0.0)
+    ) / max(denom, 1e-6)
+
+
 def train_one_epoch(model, loader, criterion, optimizer, device, cfg, epoch, total_epochs):
     model.train()
     total_loss = 0.0
@@ -242,6 +289,8 @@ def validate(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
     log = {k: 0.0 for k in ['brown', 'red', 'wrinkle', 'recon']}
+    dice_sum = dict(brown=0.0, red=0.0, wrinkle=0.0)
+    dice_cnt = dict(brown=0, red=0, wrinkle=0)
 
     pbar = tqdm(loader, desc="  Val  ", unit='batch', leave=False, dynamic_ncols=True)
 
@@ -268,11 +317,36 @@ def validate(model, loader, criterion, device):
         for k in log:
             log[k] += detail.get(k, 0.0)
 
+        brown_sum, brown_cnt = _dice_sum_and_count(
+            result.brown_mask, brown_gt, mask, batch['has_brown'],
+            threshold=CFG.get('dice_threshold', 0.5),
+        )
+        red_sum, red_cnt = _dice_sum_and_count(
+            result.red_mask, red_gt, mask, batch['has_red'],
+            threshold=CFG.get('dice_threshold', 0.5),
+        )
+        wrinkle_sum, wrinkle_cnt = _dice_sum_and_count(
+            result.wrinkle_mask, wrinkle_gt, mask, batch['has_wrinkle'],
+            threshold=CFG.get('dice_threshold', 0.5),
+        )
+
+        dice_sum['brown'] += brown_sum
+        dice_sum['red'] += red_sum
+        dice_sum['wrinkle'] += wrinkle_sum
+        dice_cnt['brown'] += brown_cnt
+        dice_cnt['red'] += red_cnt
+        dice_cnt['wrinkle'] += wrinkle_cnt
+
         pbar.set_postfix(loss=f"{total_loss / step:.4f}")
 
     pbar.close()
     n = len(loader)
-    return {'total': total_loss / n, **{k: v / n for k, v in log.items()}}
+    out = {'total': total_loss / n, **{k: v / n for k, v in log.items()}}
+    out['brown_dice'] = dice_sum['brown'] / max(dice_cnt['brown'], 1)
+    out['red_dice'] = dice_sum['red'] / max(dice_cnt['red'], 1)
+    out['wrinkle_dice'] = dice_sum['wrinkle'] / max(dice_cnt['wrinkle'], 1)
+    out['score'] = _weighted_best_score(out, CFG)
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -382,7 +456,7 @@ def main():
 
     # ── Resume ────────────────────────────────────────────────────────────────
     start_epoch = 1
-    best_val    = float('inf')
+    best_score  = float('-inf')
 
     if args.resume:
         ckpt_path = Path(args.resume)
@@ -401,9 +475,9 @@ def main():
             for _ in range(ckpt['epoch']):
                 scheduler.step()
         start_epoch = ckpt['epoch'] + 1
-        best_val    = ckpt.get('best_val', ckpt.get('val_loss', {}).get('total', float('inf')))
+        best_score  = ckpt.get('best_score', ckpt.get('val_metric', {}).get('score', float('-inf')))
         print(f"Resume: epoch {ckpt['epoch']} → {start_epoch}부터 재개  "
-              f"(best_val={best_val:.4f}  lr={scheduler.get_last_lr()[0]:.2e})")
+              f"(best_score={best_score:.4f}  lr={scheduler.get_last_lr()[0]:.2e})")
     # ─────────────────────────────────────────────────────────────────────────
 
     print("\n학습 시작...")
@@ -437,16 +511,16 @@ def main():
             torch.sigmoid(enc.freq3.low_logit).mean().item(),
         ]
 
-        is_best = val_log['total'] < best_val
+        is_best = val_log['score'] > best_score
         marker  = ' ★' if is_best else ''
 
         # 에폭 bar에 핵심 수치 표시
         epoch_bar.set_postfix(
             train=f"{train_log['total']:.4f}",
             val=f"{val_log['total']:.4f}",
-            brown=f"{val_log['brown']:.4f}",
-            red=f"{val_log['red']:.4f}",
-            wrinkle=f"{val_log['wrinkle']:.4f}",
+            bD=f"{val_log['brown_dice']:.3f}",
+            rD=f"{val_log['red_dice']:.3f}",
+            wD=f"{val_log['wrinkle_dice']:.3f}",
         )
 
         # 한 줄 요약 (tqdm 아래에 출력)
@@ -454,9 +528,13 @@ def main():
             f"[{epoch:03d}/{CFG['epochs']}]"
             f"  trn={train_log['total']:.4f}"
             f"  val={val_log['total']:.4f}"
-            f"  B={val_log['brown']:.4f}"
-            f"  R={val_log['red']:.4f}"
-            f"  W={val_log['wrinkle']:.4f}"
+            f"  B_loss={val_log['brown']:.4f}"
+            f"  R_loss={val_log['red']:.4f}"
+            f"  W_loss={val_log['wrinkle']:.4f}"
+            f"  B_dice={val_log['brown_dice']:.3f}"
+            f"  R_dice={val_log['red_dice']:.3f}"
+            f"  W_dice={val_log['wrinkle_dice']:.3f}"
+            f"  score={val_log['score']:.3f}"
             f"  rc={val_log['recon']:.4f}"
             f"  gate=[{low_gates[0]:.3f},{low_gates[1]:.3f},{low_gates[2]:.3f}]"
             f"  lr={scheduler.get_last_lr()[0]:.2e}"
@@ -469,18 +547,30 @@ def main():
             'state_dict'           : model.state_dict(),
             'optimizer_state_dict' : optimizer.state_dict(),
             'scheduler_state_dict' : scheduler.state_dict(),
-            'best_val'             : best_val,
+            'best_score'           : best_score,
             'val_loss'             : val_log,
+            'val_metric'           : {
+                'brown_dice': val_log['brown_dice'],
+                'red_dice': val_log['red_dice'],
+                'wrinkle_dice': val_log['wrinkle_dice'],
+                'score': val_log['score'],
+            },
             'cfg'                  : CFG,
         }
         torch.save(last_ckpt, Path(CFG['checkpoint_dir']) / 'last_checkpoint.pth')
 
         if is_best:
-            best_val = val_log['total']
-            last_ckpt['best_val'] = best_val          # 갱신된 값 반영
+            best_score = val_log['score']
+            last_ckpt['best_score'] = best_score
             torch.save(last_ckpt,
                        Path(CFG['checkpoint_dir']) / 'best_skin_analyzer.pth')
-            tqdm.write(f"  ★ Best 저장: val={best_val:.4f}")
+            tqdm.write(
+                "  ★ Best 저장:"
+                f" score={best_score:.3f}"
+                f" (B={val_log['brown_dice']:.3f}"
+                f", R={val_log['red_dice']:.3f}"
+                f", W={val_log['wrinkle_dice']:.3f})"
+            )
 
         # 학습 제외 이미지 예측 결과 시각화
         if (preview_loader is not None

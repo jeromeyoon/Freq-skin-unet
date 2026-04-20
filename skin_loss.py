@@ -337,28 +337,67 @@ def get_loss_weights(epoch:        int,
                      w_wrinkle:    float = 1.0,
                      w_recon:      float = 0.3) -> dict:
     """
-    단계별 loss 가중치 반환.
+    단계별 loss 가중치 반환 (wrinkle 보호 + 조명 강인성 점진 강화).
 
-    w_brown / w_red / w_wrinkle / w_recon 은 CFG 값을 그대로 사용.
-    w_consist / w_freq_reg 만 단계별 스케줄로 제어.
-
-    Phase 1 (0~40%) : supervised + recon
-    Phase 2 (40~80%): + consistency (조명 불변성 강화)
-    Phase 3 (80~100%): + freq_reg  (주파수 게이트 정규화)
+    설계 의도
+    --------
+    1) 초기에는 supervised(brown/red/wrinkle) 안정 수렴을 최우선
+    2) wrinkle는 얇은 선 구조라 초반 표현 학습이 특히 중요하므로 소폭 상향
+    3) recon/consistency/freq_reg는 wrinkle 경계를 흐릴 수 있어 더 늦고 약하게 도입
     """
-    progress = epoch / total_epochs
-    base = dict(w_brown=w_brown, w_red=w_red, w_wrinkle=w_wrinkle,
-                w_recon=w_recon, w_consist=0.0, w_freq_reg=0.0)
+    progress = epoch / max(total_epochs, 1)
 
-    # Phase 0 (0~20%): supervised only — recon off
-    # 마스크가 아직 부정확한 초반에 Beer-Lambert recon이 gradient를 왜곡하는 것을 방지
-    if progress <= 0.2:
-        return {**base, 'w_recon': 0.0}
-    # Phase 1 (20~40%): supervised + recon
-    if progress < 0.4:
+    def _lerp(a: float, b: float, t: float) -> float:
+        t = max(0.0, min(1.0, t))
+        return a + (b - a) * t
+
+    # 공통 베이스
+    # - wrinkle는 초기 얇은 선 검출 안정화를 위해 +20% 강조
+    # - red는 희소 병변 보정을 위해 +10%만 소폭 강조 (과도한 FP 방지)
+    base = dict(
+        w_brown=w_brown,
+        w_red=w_red * 1.1,
+        w_wrinkle=w_wrinkle * 1.2,
+        w_recon=0.0,
+        w_consist=0.0,
+        w_freq_reg=0.0,
+    )
+
+    # Phase 0 (0~30%): supervised only (wrinkle 우선 안정화)
+    if progress < 0.30:
         return base
-    # Phase 2 (40~80%): + consistency
-    if progress < 0.8:
-        return {**base, 'w_consist': 0.3}
-    # Phase 3 (80~100%): + freq_reg
-    return {**base, 'w_consist': 0.3, 'w_freq_reg': 0.1}
+
+    # Phase 1 (30~55%): recon 0→w_recon 선형 증가, red/wrinkle를 기본값으로 점진 복귀
+    if progress < 0.55:
+        t = (progress - 0.30) / 0.25
+        return {
+            **base,
+            'w_red': _lerp(w_red * 1.1, w_red, t),
+            'w_wrinkle': _lerp(w_wrinkle * 1.2, w_wrinkle, t),
+            'w_recon': _lerp(0.0, w_recon, t),
+        }
+
+    # Phase 2 (55~85%): consistency 0→0.2 선형 증가
+    # wrinkle 세부 구조를 과도하게 평활화하지 않도록 최대치를 낮춤
+    if progress < 0.85:
+        t = (progress - 0.55) / 0.30
+        return {
+            'w_brown': w_brown,
+            'w_red': w_red,
+            'w_wrinkle': w_wrinkle,
+            'w_recon': w_recon,
+            'w_consist': _lerp(0.0, 0.2, t),
+            'w_freq_reg': 0.0,
+        }
+
+    # Phase 3 (85~100%): consistency=0.2 유지 + freq_reg 0→0.05 선형 증가
+    # 후반 정규화는 넣되, 얇은 wrinkle 경계 손상을 막기 위해 강도는 낮게 유지
+    t = (progress - 0.85) / 0.15
+    return {
+        'w_brown': w_brown,
+        'w_red': w_red,
+        'w_wrinkle': w_wrinkle,
+        'w_recon': w_recon,
+        'w_consist': 0.2,
+        'w_freq_reg': _lerp(0.0, 0.05, t),
+    }
