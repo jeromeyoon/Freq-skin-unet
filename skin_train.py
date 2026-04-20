@@ -198,7 +198,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg, epoch, tot
         # 목적: 조명이 달라진 입력(aug)과 원본 입력의 예측이 일치 → 조명 불변성
         result_aug = None
         if criterion.w_consist > 0:
-            result_aug = model(rgb_cross, rgb_parallel, mask)
+            with torch.no_grad():
+                result_aug = model(rgb_cross, rgb_parallel, mask)
 
         loss, detail = criterion(
             result,

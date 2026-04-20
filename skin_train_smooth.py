@@ -187,7 +187,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg, epoch, tot
         # Consistency: 원본 입력으로 추가 forward (w_consist > 0 일 때만)
         result_orig = None
         if criterion.w_consist > 0:
-            result_orig = model(rgb_cross, rgb_parallel, mask)
+            with torch.no_grad():
+                result_orig = model(rgb_cross, rgb_parallel, mask)
 
         loss, detail = criterion(
             result,
