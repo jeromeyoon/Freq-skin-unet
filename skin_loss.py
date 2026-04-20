@@ -238,12 +238,16 @@ class SkinAnalyzerLoss(nn.Module):
     @staticmethod
     def _freq_reg(model: nn.Module) -> torch.Tensor:
         enc = model.cross_encoder
+        # 멀티스케일 저주파 게이트 정규화:
+        # freq1/2/3은 서로 다른 encoder 해상도 레벨이며, 모두 조명 성분이 존재한다.
+        # 얕은 레벨(freq1)이 조명 그라데이션의 직접 영향을 더 크게 받으므로 가중치를 높인다.
         gates = [
             torch.sigmoid(enc.freq1.low_logit).mean(),
             torch.sigmoid(enc.freq2.low_logit).mean(),
             torch.sigmoid(enc.freq3.low_logit).mean(),
         ]
-        return sum(gates) / len(gates)
+        weights = [0.5, 0.3, 0.2]
+        return sum(w * g for w, g in zip(weights, gates))
 
     # ── forward ─────────────────────────────────────────────────────────────
     def forward(self,
@@ -337,28 +341,67 @@ def get_loss_weights(epoch:        int,
                      w_wrinkle:    float = 1.0,
                      w_recon:      float = 0.3) -> dict:
     """
-    단계별 loss 가중치 반환.
+    단계별 loss 가중치 반환 (red spot 우선 + 조명 강인성 점진 강화).
 
-    w_brown / w_red / w_wrinkle / w_recon 은 CFG 값을 그대로 사용.
-    w_consist / w_freq_reg 만 단계별 스케줄로 제어.
-
-    Phase 1 (0~40%) : supervised + recon
-    Phase 2 (40~80%): + consistency (조명 불변성 강화)
-    Phase 3 (80~100%): + freq_reg  (주파수 게이트 정규화)
+    설계 의도
+    --------
+    1) 초기에는 supervised(red/brown/wrinkle) 안정 수렴을 최우선
+    2) 그 다음 recon/consistency/freq_reg를 순차적으로 강화
+    3) red spot 희소성 때문에 초반 red 가중치를 살짝 높여 gradient를 확보
     """
-    progress = epoch / total_epochs
-    base = dict(w_brown=w_brown, w_red=w_red, w_wrinkle=w_wrinkle,
-                w_recon=w_recon, w_consist=0.0, w_freq_reg=0.0)
+    progress = epoch / max(total_epochs, 1)
 
-    # Phase 0 (0~20%): supervised only — recon off
-    # 마스크가 아직 부정확한 초반에 Beer-Lambert recon이 gradient를 왜곡하는 것을 방지
-    if progress <= 0.2:
-        return {**base, 'w_recon': 0.0}
-    # Phase 1 (20~40%): supervised + recon
-    if progress < 0.4:
+    def _lerp(a: float, b: float, t: float) -> float:
+        t = max(0.0, min(1.0, t))
+        return a + (b - a) * t
+
+    # 공통 베이스
+    # - red는 초기 희소 클래스 보정을 위해 +20% 강조 (후반에 원래 값으로 복귀)
+    # - brown은 초기 주도권 과다를 완화하기 위해 소폭 낮게 시작
+    # - wrinkle는 초기 과적합 방지를 위해 소폭 낮게 시작
+    base = dict(
+        w_brown=w_brown * 0.95,
+        w_red=w_red * 1.2,
+        w_wrinkle=w_wrinkle * 0.9,
+        w_recon=0.0,
+        w_consist=0.0,
+        w_freq_reg=0.0,
+    )
+
+    # Phase 0 (0~20%): supervised only (red 우선)
+    if progress < 0.20:
         return base
-    # Phase 2 (40~80%): + consistency
-    if progress < 0.8:
-        return {**base, 'w_consist': 0.3}
-    # Phase 3 (80~100%): + freq_reg
-    return {**base, 'w_consist': 0.3, 'w_freq_reg': 0.1}
+
+    # Phase 1 (20~45%): recon 0→w_recon 선형 증가, red/wrinkle를 기본값으로 점진 복귀
+    if progress < 0.45:
+        t = (progress - 0.20) / 0.25
+        return {
+            **base,
+            'w_brown': _lerp(w_brown * 0.95, w_brown, t),
+            'w_red': _lerp(w_red * 1.2, w_red, t),
+            'w_wrinkle': _lerp(w_wrinkle * 0.9, w_wrinkle, t),
+            'w_recon': _lerp(0.0, w_recon, t),
+        }
+
+    # Phase 2 (45~75%): consistency 0→0.3 선형 증가
+    if progress < 0.75:
+        t = (progress - 0.45) / 0.30
+        return {
+            'w_brown': w_brown,
+            'w_red': w_red,
+            'w_wrinkle': w_wrinkle,
+            'w_recon': w_recon,
+            'w_consist': _lerp(0.0, 0.3, t),
+            'w_freq_reg': 0.0,
+        }
+
+    # Phase 3 (75~100%): consistency=0.3 유지 + freq_reg 0→0.1 선형 증가
+    t = (progress - 0.75) / 0.25
+    return {
+        'w_brown': w_brown,
+        'w_red': w_red,
+        'w_wrinkle': w_wrinkle,
+        'w_recon': w_recon,
+        'w_consist': 0.3,
+        'w_freq_reg': _lerp(0.0, 0.1, t),
+    }

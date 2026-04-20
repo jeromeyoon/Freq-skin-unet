@@ -198,7 +198,10 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg, epoch, tot
         # 목적: 조명이 달라진 입력(aug)과 원본 입력의 예측이 일치 → 조명 불변성
         result_aug = None
         if criterion.w_consist > 0:
-            result_aug = model(rgb_cross, rgb_parallel, mask)
+            # consistency pseudo-target는 stop-grad 기준점이므로
+            # 그래프를 만들지 않도록 no_grad로 계산해 메모리 사용량을 줄인다.
+            with torch.no_grad():
+                result_aug = model(rgb_cross, rgb_parallel, mask)
 
         loss, detail = criterion(
             result,
