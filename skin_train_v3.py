@@ -200,7 +200,10 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg, epoch, tot
         loss, detail = criterion(
             result,
             brown_gt, red_gt, wrinkle_gt,
-            rgb_cross=rgb_cross,
+            # recon target은 주 forward 입력과 같은 조명 조건으로 맞춘다.
+            # (증강 입력으로 예측했는데 원본 RGB를 재구성하도록 강제하면
+            # recon / supervised / consistency 사이 충돌이 커질 수 있음)
+            rgb_cross=rgb_cross_aug,
             face_mask=mask,
             has_brown=has_brown,
             has_red=has_red,
