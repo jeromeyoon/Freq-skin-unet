@@ -157,6 +157,18 @@ def generate_face_mask_v2(img_bgr: np.ndarray) -> np.ndarray:
     return mask
 
 
+def generate_face_mask_fallback_only(img_bgr: np.ndarray) -> np.ndarray:
+    """MediaPipe를 전혀 사용하지 않고 fallback 마스크만 생성한다."""
+    h, w = img_bgr.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cx, cy = w // 2, int(h * 0.43)
+    axes = (int(w * 0.33), int(h * 0.36))
+    cv2.ellipse(mask, (cx, cy), axes, 0, 0, 360, 255, -1)
+    neck_cut_y = min(h, cy + int(axes[1] * 0.78))
+    mask[neck_cut_y:, :] = 0
+    return mask
+
+
 def apply_mask_to_rgb(rgb_bgr_patch: np.ndarray, mask_patch: np.ndarray) -> np.ndarray:
     """얼굴 영역만 남기고 배경을 0으로 만든다."""
     return cv2.bitwise_and(rgb_bgr_patch, rgb_bgr_patch, mask=mask_patch)
@@ -194,6 +206,7 @@ def prepare(
     apply_mask: bool = True,
     neg_pos_ratio: float = 2.0,
     max_negative_if_no_positive: int = 0,
+    disable_mediapipe: bool = False,
 ) -> None:
     input_root = Path(input_path)
     gt_root = Path(gt_path)
@@ -242,7 +255,10 @@ def prepare(
         h, w = cross_bgr.shape[:2]
         parallel_bgr = load_rgb_bgr(parallel_path, target_hw=(h, w))
 
-        face_mask = generate_face_mask_v2(cross_bgr)
+        if disable_mediapipe:
+            face_mask = generate_face_mask_fallback_only(cross_bgr)
+        else:
+            face_mask = generate_face_mask_v2(cross_bgr)
 
         gt_arrays = {}
         for task, gt_p in gt_paths.items():
@@ -379,6 +395,11 @@ if __name__ == "__main__":
         default=0,
         help="positive가 하나도 없을 때 유지할 negative patch 최대 개수 (기본 0)",
     )
+    parser.add_argument(
+        "--disable_mediapipe",
+        action="store_true",
+        help="MediaPipe를 사용하지 않고 fallback 얼굴 마스크만 사용",
+    )
     args = parser.parse_args()
 
     prepare(
@@ -391,4 +412,5 @@ if __name__ == "__main__":
         apply_mask=not args.no_apply_mask,
         neg_pos_ratio=args.neg_pos_ratio,
         max_negative_if_no_positive=args.max_negative_if_no_positive,
+        disable_mediapipe=args.disable_mediapipe,
     )
