@@ -47,7 +47,7 @@ from tqdm import tqdm
 from skin_net          import build_analyzer
 from skin_loss_smooth  import SkinAnalyzerLoss, get_loss_weights
 from skin_dataset      import SkinDataset, skin_collate_fn, ExcludedDataset, preview_collate_fn
-from ambient_aug       import apply_batch_illumination_aug
+from ambient_aug       import _make_directional_gradient, _make_vignette_torch
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -81,7 +81,7 @@ CFG = dict(
 
     aug_warmup_epochs = 30,
 
-    use_weighted_sampler = True,
+    use_weighted_sampler = False,
     sampler_neg_weight   = 0.05,
 
     intensity_range   = (0.6, 1.4),
@@ -186,6 +186,101 @@ def _weighted_best_score(val_log: dict, cfg: dict) -> float:
     ) / max(denom, 1e-6)
 
 
+def _apply_illumination_aug_with_params(
+    rgb: torch.Tensor,
+    *,
+    intensity: float,
+    ch_scales: torch.Tensor,
+    tint: torch.Tensor,
+    use_vignette: bool,
+    vignette_strength: float | None,
+    use_gradient: bool,
+) -> torch.Tensor:
+    """
+    동일하게 샘플링된 조명 augmentation 파라미터를 재사용해
+    cross / parallel 편광 입력 쌍에 같은 변형을 적용한다.
+    """
+    device = rgb.device
+    h, w = rgb.shape[1], rgb.shape[2]
+
+    rgb_aug = rgb * intensity
+    rgb_aug = rgb_aug * ch_scales.view(3, 1, 1)
+    rgb_aug = rgb_aug * tint.view(3, 1, 1)
+
+    if use_vignette:
+        vignette = _make_vignette_torch(h, w, vignette_strength, device)
+        rgb_aug = rgb_aug * vignette.unsqueeze(0)
+    elif use_gradient:
+        grad = _make_directional_gradient(h, w, device)
+        rgb_aug = rgb_aug * grad.unsqueeze(0)
+
+    return rgb_aug.clamp(0.0, 1.0)
+
+
+def apply_paired_batch_illumination_aug(
+    rgb_cross_batch: torch.Tensor,
+    rgb_parallel_batch: torch.Tensor,
+    *,
+    intensity_range: tuple = (0.6, 1.4),
+    color_temp_range: tuple = (0.7, 1.3),
+    tint_range: tuple = (0.8, 1.2),
+    vignette_prob: float = 0.5,
+    vignette_strength: float = 0.4,
+    gradient_prob: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    같은 샘플의 rgb_cross / rgb_parallel 에 동일한 illumination augmentation 적용.
+    """
+    assert rgb_cross_batch.shape == rgb_parallel_batch.shape, (
+        "rgb_cross_batch and rgb_parallel_batch must have the same shape"
+    )
+
+    cross_out = []
+    parallel_out = []
+
+    for i in range(rgb_cross_batch.shape[0]):
+        cross = rgb_cross_batch[i]
+        parallel = rgb_parallel_batch[i]
+        device = cross.device
+
+        intensity = torch.empty(1, device=device).uniform_(*intensity_range).item()
+        ch_scales = torch.empty(3, device=device).uniform_(*color_temp_range)
+        tint = torch.ones(3, device=device)
+        tint[0] = torch.empty(1, device=device).uniform_(*tint_range).item()
+        tint[2] = torch.empty(1, device=device).uniform_(*tint_range).item()
+
+        r = torch.rand(1, device=device).item()
+        use_vignette = r < vignette_prob
+        use_gradient = (not use_vignette) and (r < vignette_prob + gradient_prob)
+        sampled_vignette_strength = None
+        if use_vignette:
+            sampled_vignette_strength = torch.empty(1, device=device).uniform_(0.1, vignette_strength).item()
+
+        cross_aug = _apply_illumination_aug_with_params(
+            cross,
+            intensity=intensity,
+            ch_scales=ch_scales,
+            tint=tint,
+            use_vignette=use_vignette,
+            vignette_strength=sampled_vignette_strength,
+            use_gradient=use_gradient,
+        )
+        parallel_aug = _apply_illumination_aug_with_params(
+            parallel,
+            intensity=intensity,
+            ch_scales=ch_scales,
+            tint=tint,
+            use_vignette=use_vignette,
+            vignette_strength=sampled_vignette_strength,
+            use_gradient=use_gradient,
+        )
+
+        cross_out.append(cross_aug)
+        parallel_out.append(parallel_aug)
+
+    return torch.stack(cross_out), torch.stack(parallel_out)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 학습
 # ══════════════════════════════════════════════════════════════════════════════
@@ -226,17 +321,22 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg, epoch, tot
         has_red     = batch['has_red']
         has_wrinkle = batch['has_wrinkle']
 
-        # 조명 변형 입력으로 주 forward
-        rgb_cross_aug    = apply_batch_illumination_aug(rgb_cross,    **aug_kwargs)
-        rgb_parallel_aug = apply_batch_illumination_aug(rgb_parallel, **aug_kwargs)
+        # 같은 샘플의 편광 쌍에는 동일한 조명 augmentation 적용
+        rgb_cross_aug, rgb_parallel_aug = apply_paired_batch_illumination_aug(
+            rgb_cross, rgb_parallel, **aug_kwargs
+        )
         result = model(rgb_cross_aug, rgb_parallel_aug, mask)
 
         # Consistency: 원본(비증강) 입력 추가 forward — 증강 출력과 비교해 조명 불변성 학습
         # result_clean은 detach된 레퍼런스(pseudo-label)로 loss 내부에서 .detach() 재적용
         result_clean = None
         if criterion.w_consist > 0:
+            was_training = model.training
+            model.eval()
             with torch.no_grad():
                 result_clean = model(rgb_cross, rgb_parallel, mask)
+            if was_training:
+                model.train()
 
         loss, detail = criterion(
             result,
