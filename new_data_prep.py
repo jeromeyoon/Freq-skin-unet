@@ -54,6 +54,11 @@ _INNER_MOUTH = [
     78, 191, 80, 81, 82, 13, 312, 311, 310, 415,
     308, 324, 318, 402, 317, 14, 87, 178,
 ]
+_JAWLINE = [
+    234, 93, 132, 58, 172, 136, 150, 149, 176, 148,
+    152,
+    377, 400, 378, 379, 365, 397, 288, 361, 323, 454,
+]
 
 _EXCLUDE_REGIONS_V2 = [
     _LEFT_EYE,
@@ -110,10 +115,18 @@ def generate_face_mask_mediapipe_v2(
         excl = cv2.dilate(excl, k_dilate, iterations=1)
         mask = cv2.bitwise_and(mask, cv2.bitwise_not(excl))
 
-    # 목 제거: 턱 끝 landmark(152) 아래는 잘라낸다.
-    chin_y = int(lm[152].y * h)
-    neck_cut_y = min(h, chin_y + max(4, int(h * 0.015)))
-    mask[neck_cut_y:, :] = 0
+    # jawline 아래 영역을 polygon으로 잘라서 목을 제거
+    jaw_pts = lm_pts(_JAWLINE)
+    jaw_cut = np.vstack([
+        jaw_pts,
+        np.array([[w - 1, h - 1], [0, h - 1]], dtype=np.int32),
+    ])
+    neck_region = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(neck_region, [jaw_cut], 255)
+    # 턱선 바로 아래가 남지 않도록 소폭 팽창
+    jaw_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    neck_region = cv2.dilate(neck_region, jaw_dilate, iterations=1)
+    mask = cv2.bitwise_and(mask, cv2.bitwise_not(neck_region))
 
     return mask
 
