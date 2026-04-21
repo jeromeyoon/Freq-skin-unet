@@ -1,19 +1,23 @@
 """
 new_data_prep.py
 ================
-VISIA 얼굴 이미지용 패치 생성 스크립트.
+VISIA 얼굴 이미지에서 학습용 패치를 생성한다.
 
-기존 data_prep.py를 기반으로 다음을 보강했다.
-1. 얼굴 마스크에서 눈/눈썹뿐 아니라 입술/입 영역도 제외
-2. 저장 전 RGB/GT에 얼굴 마스크를 적용해 불필요 영역을 0으로 제거
-
-입력 예시
+주요 기능
 ---------
+1. 최신 MediaPipe Tasks API(FaceLandmarker) 지원
+2. 얼굴 타원 + jawline 기준 목 제거
+3. 눈 / 눈썹 / 입술 / 입 내부 제외
+4. RGB / GT 저장 시 얼굴 마스크 적용 가능
+5. negative patch 수 제한
+
+예시
+----
 python new_data_prep.py \
     --input_path ./raw_data/images \
-    --gt_path    ./raw_data/gt \
-    --patch_dir  ./patches_v2 \
-    --patch_size 256 --stride 256
+    --gt_path ./raw_data/gt \
+    --patch_dir ./patches_v2 \
+    --face_landmarker_task_path ./models/face_landmarker.task
 """
 
 from __future__ import annotations
@@ -33,7 +37,6 @@ from data_prep import (
     _LEFT_EYEBROW,
     _RIGHT_EYE,
     _RIGHT_EYEBROW,
-    _try_import_mediapipe,
     bgr2rgb_pil,
     build_gt_id_map,
     crop_patch,
@@ -44,16 +47,17 @@ from data_prep import (
 )
 
 
-# MediaPipe Face Mesh indices
 _OUTER_LIPS = [
     61, 146, 91, 181, 84, 17, 314, 405, 321, 375,
     291, 308, 324, 318, 402, 317, 14, 87, 178, 88,
     95, 78,
 ]
+
 _INNER_MOUTH = [
     78, 191, 80, 81, 82, 13, 312, 311, 310, 415,
     308, 324, 318, 402, 317, 14, 87, 178,
 ]
+
 _JAWLINE = [
     234, 93, 132, 58, 172, 136, 150, 149, 176, 148,
     152,
@@ -70,29 +74,63 @@ _EXCLUDE_REGIONS_V2 = [
 ]
 
 
-def generate_face_mask_mediapipe_v2(
+def create_face_landmarker(task_model_path: str | None):
+    """
+    최신 MediaPipe Tasks API용 FaceLandmarker를 생성한다.
+    실패 시 (None, None)을 반환한다.
+    """
+    if not task_model_path:
+        print("    [WARN] face_landmarker.task 경로가 없어 fallback 사용")
+        return None, None
+
+    model_path = Path(task_model_path)
+    if not model_path.exists():
+        print(f"    [WARN] 모델 파일이 없습니다: {model_path} -> fallback 사용")
+        return None, None
+
+    try:
+        import mediapipe as mp
+
+        BaseOptions = mp.tasks.BaseOptions
+        FaceLandmarker = mp.tasks.vision.FaceLandmarker
+        FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+        VisionRunningMode = mp.tasks.vision.RunningMode
+
+        options = FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(model_path)),
+            running_mode=VisionRunningMode.IMAGE,
+            num_faces=1,
+            min_face_detection_confidence=0.4,
+            min_face_presence_confidence=0.4,
+            min_tracking_confidence=0.4,
+            output_face_blendshapes=False,
+            output_facial_transformation_matrixes=False,
+        )
+        landmarker = FaceLandmarker.create_from_options(options)
+        return mp, landmarker
+    except Exception as e:
+        print(f"    [WARN] FaceLandmarker 초기화 실패 ({e}) -> fallback 사용")
+        return None, None
+
+
+def generate_face_mask_tasks(
     img_bgr: np.ndarray,
-    mp_face_mesh,
+    mp,
+    landmarker,
 ) -> np.ndarray | None:
     """
-    얼굴 타원 내부를 채운 뒤, 눈/눈썹/입술/입 내부를 제외한 얼굴 마스크를 생성한다.
-    반환값: uint8 [H, W], 얼굴=255 / 배경=0
+    MediaPipe Tasks FaceLandmarker 결과로 얼굴 마스크를 만든다.
     """
     h, w = img_bgr.shape[:2]
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.4,
-    ) as fm:
-        results = fm.process(img_rgb)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+    results = landmarker.detect(mp_image)
 
-    if not results.multi_face_landmarks:
+    if not results.face_landmarks:
         return None
 
-    lm = results.multi_face_landmarks[0].landmark
+    lm = results.face_landmarks[0]
 
     def lm_pts(indices: list[int]) -> np.ndarray:
         return np.array(
@@ -103,7 +141,7 @@ def generate_face_mask_mediapipe_v2(
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.fillPoly(mask, [lm_pts(_FACE_OVAL)], 255)
 
-    # 타원 경계를 조금 안쪽으로 줄여 머리카락/배경 혼입을 완화
+    # hair / background 혼입 완화
     k_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     mask = cv2.erode(mask, k_erode, iterations=2)
 
@@ -115,7 +153,7 @@ def generate_face_mask_mediapipe_v2(
         excl = cv2.dilate(excl, k_dilate, iterations=1)
         mask = cv2.bitwise_and(mask, cv2.bitwise_not(excl))
 
-    # jawline 아래 영역을 polygon으로 잘라서 목을 제거
+    # jawline 아래를 제거해서 목 제외
     jaw_pts = lm_pts(_JAWLINE)
     jaw_cut = np.vstack([
         jaw_pts,
@@ -123,7 +161,6 @@ def generate_face_mask_mediapipe_v2(
     ])
     neck_region = np.zeros((h, w), dtype=np.uint8)
     cv2.fillPoly(neck_region, [jaw_cut], 255)
-    # 턱선 바로 아래가 남지 않도록 소폭 팽창
     jaw_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     neck_region = cv2.dilate(neck_region, jaw_dilate, iterations=1)
     mask = cv2.bitwise_and(mask, cv2.bitwise_not(neck_region))
@@ -131,61 +168,54 @@ def generate_face_mask_mediapipe_v2(
     return mask
 
 
-def generate_face_mask_v2(img_bgr: np.ndarray) -> np.ndarray:
+def generate_face_mask_fallback_only(img_bgr: np.ndarray) -> np.ndarray:
     """
-    MediaPipe를 우선 사용하고, 실패하면 기존 ellipse fallback을 사용한다.
+    MediaPipe 없이 중앙 타원형 얼굴 ROI를 생성한다.
+    정밀 jawline은 아니지만 VISIA 정면 사진에서 안정적으로 동작하는 fallback이다.
     """
-    mp = _try_import_mediapipe()
-    if mp is not None:
+    h, w = img_bgr.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cx, cy = w // 2, int(h * 0.43)
+    axes = (int(w * 0.33), int(h * 0.36))
+    cv2.ellipse(mask, (cx, cy), axes, 0, 0, 360, 255, -1)
+
+    # 목/하단 배경 제거
+    neck_cut_y = min(h, cy + int(axes[1] * 0.78))
+    mask[neck_cut_y:, :] = 0
+    return mask
+
+
+def generate_face_mask_v2(
+    img_bgr: np.ndarray,
+    mp=None,
+    landmarker=None,
+) -> np.ndarray:
+    """
+    MediaPipe Tasks를 우선 사용하고, 실패하면 fallback 마스크를 사용한다.
+    """
+    if mp is not None and landmarker is not None:
         try:
-            mask = generate_face_mask_mediapipe_v2(img_bgr, mp.solutions.face_mesh)
+            mask = generate_face_mask_tasks(img_bgr, mp, landmarker)
             if mask is not None:
                 return mask
-            print("    [WARN] MediaPipe 얼굴 검출 실패 -> ellipse fallback")
+            print("    [WARN] FaceLandmarker가 얼굴을 찾지 못해 fallback 사용")
         except Exception as e:
-            print(f"    [WARN] MediaPipe runtime failure ({e}) -> ellipse fallback")
+            print(f"    [WARN] FaceLandmarker runtime failure ({e}) -> fallback 사용")
 
-    h, w = img_bgr.shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cx, cy = w // 2, int(h * 0.43)
-    axes = (int(w * 0.33), int(h * 0.36))
-    cv2.ellipse(mask, (cx, cy), axes, 0, 0, 360, 255, -1)
-
-    # fallback에서도 목/하부 배경이 섞이지 않도록 하단을 한 번 더 절단
-    neck_cut_y = min(h, cy + int(axes[1] * 0.78))
-    mask[neck_cut_y:, :] = 0
-    return mask
-
-
-def generate_face_mask_fallback_only(img_bgr: np.ndarray) -> np.ndarray:
-    """MediaPipe를 전혀 사용하지 않고 fallback 마스크만 생성한다."""
-    h, w = img_bgr.shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cx, cy = w // 2, int(h * 0.43)
-    axes = (int(w * 0.33), int(h * 0.36))
-    cv2.ellipse(mask, (cx, cy), axes, 0, 0, 360, 255, -1)
-    neck_cut_y = min(h, cy + int(axes[1] * 0.78))
-    mask[neck_cut_y:, :] = 0
-    return mask
+    return generate_face_mask_fallback_only(img_bgr)
 
 
 def apply_mask_to_rgb(rgb_bgr_patch: np.ndarray, mask_patch: np.ndarray) -> np.ndarray:
-    """얼굴 영역만 남기고 배경을 0으로 만든다."""
     return cv2.bitwise_and(rgb_bgr_patch, rgb_bgr_patch, mask=mask_patch)
 
 
 def apply_mask_to_gray(gray_patch: np.ndarray, mask_patch: np.ndarray) -> np.ndarray:
-    """GT에서도 얼굴 바깥 영역을 0으로 만든다."""
     return cv2.bitwise_and(gray_patch, gray_patch, mask=mask_patch)
 
 
-def select_negative_indices(
-    num_negative: int,
-    keep_count: int,
-) -> set[int]:
+def select_negative_indices(num_negative: int, keep_count: int) -> set[int]:
     """
     negative patch를 균등 간격으로 일부만 선택한다.
-    순차 추출 편향을 줄이기 위해 linspace 기반으로 고른다.
     """
     if keep_count <= 0 or num_negative <= 0:
         return set()
@@ -207,6 +237,7 @@ def prepare(
     neg_pos_ratio: float = 2.0,
     max_negative_if_no_positive: int = 0,
     disable_mediapipe: bool = False,
+    face_landmarker_task_path: str | None = None,
 ) -> None:
     input_root = Path(input_path)
     gt_root = Path(gt_path)
@@ -228,128 +259,140 @@ def prepare(
     total_patches = 0
     skipped_ids: list[str] = []
 
-    for subj_dir in subject_dirs:
-        subject_name = subj_dir.name
+    mp = None
+    landmarker = None
+    if not disable_mediapipe:
+        mp, landmarker = create_face_landmarker(face_landmarker_task_path)
 
-        cross_path = subj_dir / "F_10.jpg"
-        parallel_path = subj_dir / "F_11.jpg"
+    try:
+        for subj_dir in subject_dirs:
+            subject_name = subj_dir.name
 
-        if not cross_path.exists() or not parallel_path.exists():
-            print(f"  [SKIP] {subject_name}: F_10.jpg / F_11.jpg 없음")
-            skipped_ids.append(subject_name)
-            continue
+            cross_path = subj_dir / "F_10.jpg"
+            parallel_path = subj_dir / "F_11.jpg"
 
-        gt_paths = {
-            task: find_matching_gt(subject_name, gt_maps[task])
-            for task in GT_SUBDIRS
-        }
-        has_gt = {task: p is not None for task, p in gt_paths.items()}
-        matched = [t for t, h in has_gt.items() if h]
-        print(
-            f"  {subject_name}: GT={matched}"
-            if matched
-            else f"  [INFO] {subject_name}: 매칭된 GT 없음 -> 입력 only"
-        )
+            if not cross_path.exists() or not parallel_path.exists():
+                print(f"  [SKIP] {subject_name}: F_10.jpg / F_11.jpg 없음")
+                skipped_ids.append(subject_name)
+                continue
 
-        cross_bgr = load_rgb_bgr(cross_path)
-        h, w = cross_bgr.shape[:2]
-        parallel_bgr = load_rgb_bgr(parallel_path, target_hw=(h, w))
+            gt_paths = {
+                task: find_matching_gt(subject_name, gt_maps[task])
+                for task in GT_SUBDIRS
+            }
+            has_gt = {task: p is not None for task, p in gt_paths.items()}
+            matched = [t for t, h in has_gt.items() if h]
+            if matched:
+                print(f"  {subject_name}: GT={matched}")
+            else:
+                print(f"  [INFO] {subject_name}: 매칭된 GT 없음 -> 입력 only")
 
-        if disable_mediapipe:
-            face_mask = generate_face_mask_fallback_only(cross_bgr)
-        else:
-            face_mask = generate_face_mask_v2(cross_bgr)
+            cross_bgr = load_rgb_bgr(cross_path)
+            h, w = cross_bgr.shape[:2]
+            parallel_bgr = load_rgb_bgr(parallel_path, target_hw=(h, w))
 
-        gt_arrays = {}
-        for task, gt_p in gt_paths.items():
-            if gt_p is not None:
-                gt_arrays[task] = load_gray(gt_p, target_hw=(h, w))
+            if disable_mediapipe:
+                face_mask = generate_face_mask_fallback_only(cross_bgr)
+            else:
+                face_mask = generate_face_mask_v2(cross_bgr, mp=mp, landmarker=landmarker)
 
-        valid_positions = find_valid_positions(
-            face_mask, patch_size, stride, min_mask_coverage
-        )
+            gt_arrays = {}
+            for task, gt_p in gt_paths.items():
+                if gt_p is not None:
+                    gt_arrays[task] = load_gray(gt_p, target_hw=(h, w))
 
-        patch_candidates = []
-        for y, x in valid_positions:
-            c_p = crop_patch(cross_bgr, y, x, patch_size)
-            p_p = crop_patch(parallel_bgr, y, x, patch_size)
-            m_p = crop_patch(face_mask, y, x, patch_size)
+            valid_positions = find_valid_positions(
+                face_mask, patch_size, stride, min_mask_coverage
+            )
 
-            if apply_mask:
-                c_p = apply_mask_to_rgb(c_p, m_p)
-                p_p = apply_mask_to_rgb(p_p, m_p)
+            patch_candidates = []
+            for y, x in valid_positions:
+                c_p = crop_patch(cross_bgr, y, x, patch_size)
+                p_p = crop_patch(parallel_bgr, y, x, patch_size)
+                m_p = crop_patch(face_mask, y, x, patch_size)
 
-            gt_pos_ratios = {}
-            is_positive = False
-            gt_patch_map = {}
-            for task in ["brown", "red", "wrinkle"]:
-                if task in gt_arrays:
-                    gt_patch = crop_patch(gt_arrays[task], y, x, patch_size)
-                    if apply_mask:
-                        gt_patch = apply_mask_to_gray(gt_patch, m_p)
-                    gt_patch_map[task] = gt_patch
-                    pos_ratio = float((gt_patch > 127).sum()) / gt_patch.size
-                    gt_pos_ratios[f"{task}_pos_ratio"] = round(pos_ratio, 6)
-                    if pos_ratio > 0.0:
-                        is_positive = True
+                if apply_mask:
+                    c_p = apply_mask_to_rgb(c_p, m_p)
+                    p_p = apply_mask_to_rgb(p_p, m_p)
 
-            patch_candidates.append({
-                "y": y,
-                "x": x,
-                "cross": c_p,
-                "parallel": p_p,
-                "mask": m_p,
-                "gt_patch_map": gt_patch_map,
-                "gt_pos_ratios": gt_pos_ratios,
-                "is_positive": is_positive,
-            })
+                gt_pos_ratios = {}
+                is_positive = False
+                gt_patch_map = {}
+                for task in ["brown", "red", "wrinkle"]:
+                    if task in gt_arrays:
+                        gt_patch = crop_patch(gt_arrays[task], y, x, patch_size)
+                        if apply_mask:
+                            gt_patch = apply_mask_to_gray(gt_patch, m_p)
+                        gt_patch_map[task] = gt_patch
 
-        positives = [p for p in patch_candidates if p["is_positive"]]
-        negatives = [p for p in patch_candidates if not p["is_positive"]]
+                        pos_ratio = float((gt_patch > 127).sum()) / gt_patch.size
+                        gt_pos_ratios[f"{task}_pos_ratio"] = round(pos_ratio, 6)
+                        if pos_ratio > 0.0:
+                            is_positive = True
 
-        if positives:
-            neg_keep_count = min(len(negatives), int(np.ceil(len(positives) * neg_pos_ratio)))
-        else:
-            neg_keep_count = min(len(negatives), max_negative_if_no_positive)
-
-        neg_keep_indices = select_negative_indices(len(negatives), neg_keep_count)
-        selected_patches = positives + [
-            neg for i, neg in enumerate(negatives) if i in neg_keep_indices
-        ]
-
-        saved = 0
-        for idx, patch in enumerate(selected_patches):
-            y = patch["y"]
-            x = patch["x"]
-            stem = f"{subject_name}_{idx:04d}"
-
-            bgr2rgb_pil(patch["cross"]).save(out_root / "rgb_cross" / f"{stem}.png")
-            bgr2rgb_pil(patch["parallel"]).save(out_root / "rgb_parallel" / f"{stem}.png")
-            Image.fromarray(patch["mask"], mode="L").save(out_root / "mask" / f"{stem}.png")
-
-            for task, gt_patch in patch["gt_patch_map"].items():
-                Image.fromarray(gt_patch, mode="L").save(
-                    out_root / task / f"{stem}.png"
+                patch_candidates.append(
+                    {
+                        "y": y,
+                        "x": x,
+                        "cross": c_p,
+                        "parallel": p_p,
+                        "mask": m_p,
+                        "gt_patch_map": gt_patch_map,
+                        "gt_pos_ratios": gt_pos_ratios,
+                        "is_positive": is_positive,
+                    }
                 )
 
-            manifest[stem] = {
-                "subject_name": subject_name,
-                "patch_idx": idx,
-                "patch_pos": [y, x],
-                "has_brown": has_gt["brown"],
-                "has_red": has_gt["red"],
-                "has_wrinkle": has_gt["wrinkle"],
-                "mask_applied": apply_mask,
-                "is_positive": patch["is_positive"],
-                **patch["gt_pos_ratios"],
-            }
-            saved += 1
-            total_patches += 1
+            positives = [p for p in patch_candidates if p["is_positive"]]
+            negatives = [p for p in patch_candidates if not p["is_positive"]]
 
-        print(
-            f"    -> {saved}개 패치 저장 "
-            f"(positive={len(positives)}, negative_kept={neg_keep_count}/{len(negatives)})"
-        )
+            if positives:
+                neg_keep_count = min(
+                    len(negatives),
+                    int(np.ceil(len(positives) * neg_pos_ratio)),
+                )
+            else:
+                neg_keep_count = min(len(negatives), max_negative_if_no_positive)
+
+            neg_keep_indices = select_negative_indices(len(negatives), neg_keep_count)
+            selected_patches = positives + [
+                neg for i, neg in enumerate(negatives) if i in neg_keep_indices
+            ]
+
+            saved = 0
+            for idx, patch in enumerate(selected_patches):
+                y = patch["y"]
+                x = patch["x"]
+                stem = f"{subject_name}_{idx:04d}"
+
+                bgr2rgb_pil(patch["cross"]).save(out_root / "rgb_cross" / f"{stem}.png")
+                bgr2rgb_pil(patch["parallel"]).save(out_root / "rgb_parallel" / f"{stem}.png")
+                Image.fromarray(patch["mask"], mode="L").save(out_root / "mask" / f"{stem}.png")
+
+                for task, gt_patch in patch["gt_patch_map"].items():
+                    Image.fromarray(gt_patch, mode="L").save(out_root / task / f"{stem}.png")
+
+                manifest[stem] = {
+                    "subject_name": subject_name,
+                    "patch_idx": idx,
+                    "patch_pos": [y, x],
+                    "has_brown": has_gt["brown"],
+                    "has_red": has_gt["red"],
+                    "has_wrinkle": has_gt["wrinkle"],
+                    "mask_applied": apply_mask,
+                    "is_positive": patch["is_positive"],
+                    **patch["gt_pos_ratios"],
+                }
+                saved += 1
+                total_patches += 1
+
+            print(
+                f"    -> {saved}개 패치 저장 "
+                f"(positive={len(positives)}, negative_kept={neg_keep_count}/{len(negatives)})"
+            )
+    finally:
+        if landmarker is not None:
+            landmarker.close()
 
     manifest_path = out_root / "manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
@@ -370,7 +413,7 @@ def prepare(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="VISIA 얼굴 패치 생성기 (입술 제외 + 마스킹 적용 버전)"
+        description="VISIA 얼굴 패치 생성기 (최신 MediaPipe Tasks API 지원)"
     )
     parser.add_argument("--input_path", required=True)
     parser.add_argument("--gt_path", required=True)
@@ -400,6 +443,12 @@ if __name__ == "__main__":
         action="store_true",
         help="MediaPipe를 사용하지 않고 fallback 얼굴 마스크만 사용",
     )
+    parser.add_argument(
+        "--face_landmarker_task_path",
+        type=str,
+        default=None,
+        help="최신 MediaPipe Tasks API용 face_landmarker.task 모델 경로",
+    )
     args = parser.parse_args()
 
     prepare(
@@ -413,4 +462,5 @@ if __name__ == "__main__":
         neg_pos_ratio=args.neg_pos_ratio,
         max_negative_if_no_positive=args.max_negative_if_no_positive,
         disable_mediapipe=args.disable_mediapipe,
+        face_landmarker_task_path=args.face_landmarker_task_path,
     )
