@@ -184,11 +184,12 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg, epoch, tot
         rgb_parallel_aug = apply_batch_illumination_aug(rgb_parallel, **aug_kwargs)
         result = model(rgb_cross_aug, rgb_parallel_aug, mask)
 
-        # Consistency: 원본 입력으로 추가 forward (w_consist > 0 일 때만)
-        result_orig = None
+        # Consistency: 원본(비증강) 입력 추가 forward — 증강 출력과 비교해 조명 불변성 학습
+        # result_clean은 detach된 레퍼런스(pseudo-label)로 loss 내부에서 .detach() 재적용
+        result_clean = None
         if criterion.w_consist > 0:
             with torch.no_grad():
-                result_orig = model(rgb_cross, rgb_parallel, mask)
+                result_clean = model(rgb_cross, rgb_parallel, mask)
 
         loss, detail = criterion(
             result,
@@ -198,7 +199,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, cfg, epoch, tot
             has_brown   = has_brown,
             has_red     = has_red,
             has_wrinkle = has_wrinkle,
-            result_aug  = result_orig,
+            result_aug  = result_clean,   # loss에서 result_aug = "비교 기준 출력"
             model       = model if criterion.w_freq_reg > 0 else None,
         )
 

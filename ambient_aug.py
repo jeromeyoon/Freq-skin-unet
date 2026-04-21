@@ -33,7 +33,7 @@ def _make_vignette_torch(H: int, W: int, strength: float,
     sigma    = min(H, W) / (2.0 * strength)
     mask     = torch.exp(-dist ** 2 / (2 * sigma ** 2))
     vignette = 1.0 - strength * (1.0 - mask)
-    return vignette.clamp(0.1, 1.0)                      # [H, W]
+    return vignette.clamp(0.5, 1.0)                      # [H, W] — 0.1→0.5: 극단적 어두움 방지
 
 
 def _make_directional_gradient(H: int, W: int,
@@ -103,14 +103,14 @@ def apply_illumination_aug(rgb: torch.Tensor,
     tint[2]   = torch.empty(1, device=device).uniform_(*tint_range).item()
     rgb_aug   = rgb_aug * tint.view(3, 1, 1)
 
-    # 4. Vignetting — 원형 국소 조명 (스탠드, 포인트 광원)
-    if torch.rand(1, device=device).item() < vignette_prob:
+    # 4 & 5. Vignetting OR 방향성 그라데이션 — 하나만 적용 (누적 어두움 방지)
+    # 둘 다 적용되면 최악 0.5×0.6=0.30 배율로 기존 color 변형과 곱해져 이미지 파괴
+    r = torch.rand(1, device=device).item()
+    if r < vignette_prob:
         strength = torch.empty(1, device=device).uniform_(0.1, vignette_strength).item()
         vignette = _make_vignette_torch(H, W, strength, device)
         rgb_aug  = rgb_aug * vignette.unsqueeze(0)
-
-    # 5. 방향성 그라데이션 — 천장 조명 / 창문 (실내 핵심)
-    if torch.rand(1, device=device).item() < gradient_prob:
+    elif r < vignette_prob + gradient_prob:
         grad    = _make_directional_gradient(H, W, device)
         rgb_aug = rgb_aug * grad.unsqueeze(0)
 

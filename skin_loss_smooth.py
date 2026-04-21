@@ -32,7 +32,7 @@ from skin_net import SkinResult
 # ══════════════════════════════════════════════════════════════════════════════
 # 기본 Loss 함수 (변경 없음)
 # ══════════════════════════════════════════════════════════════════════════════
-def _dice_loss_per_sample(pred, gt, face_mask, smooth=0.1):
+def _dice_loss_per_sample(pred, gt, face_mask, smooth=1.0):
     prob = torch.sigmoid(pred)
     p = prob * face_mask
     g = gt   * face_mask

@@ -127,8 +127,8 @@ class SkinDataset(Dataset):
         없는 경우(구버전 manifest)에만 GT 파일을 직접 읽어 보완하고
         결과를 manifest.json에 저장 → 다음 실행부터 즉시 반환.
 
-        weight = sqrt(max_pos_ratio)  — 양성 픽셀 있음
-        weight = neg_weight           — 모든 GT가 전부 검은색 (양성 0%)
+        weight = brown_ratio + red_ratio + wrinkle_ratio  — task별 합산 (선형)
+        weight = neg_weight                               — 모든 GT가 전부 검은색
         """
         missing = [
             stem for stem in self.stems
@@ -144,30 +144,32 @@ class SkinDataset(Dataset):
                   f"→ GT 파일 직접 계산 후 manifest.json 에 저장")
 
         weights = []
+        new_ratios_computed = False
         iter_stems = tqdm(self.stems, desc='pos_ratio 계산 중', leave=False) \
             if missing else self.stems
 
         for stem in iter_stems:
             info = self.manifest[stem]
-            max_ratio = 0.0
+            total_ratio = 0.0
 
             for task in ('brown', 'red', 'wrinkle'):
                 ratio_key = f'{task}_pos_ratio'
                 if ratio_key in info:
-                    max_ratio = max(max_ratio, info[ratio_key])
+                    total_ratio += info[ratio_key]
                 elif info.get(f'has_{task}', False):
                     gt_path = self.patch_dir / task / f'{stem}.png'
                     if gt_path.exists():
                         arr = np.array(Image.open(gt_path).convert('L'))
                         r = round(float((arr > 127).sum()) / arr.size, 6)
-                        self.manifest[stem][ratio_key] = r   # 직접 접근으로 확실히 업데이트
-                        max_ratio = max(max_ratio, r)
+                        self.manifest[stem][ratio_key] = r
+                        total_ratio += r
+                        new_ratios_computed = True
 
-            w = math.sqrt(max_ratio) if max_ratio > 0 else neg_weight
+            w = total_ratio if total_ratio > 0 else neg_weight
             weights.append(w)
 
-        # missing이 있었으면 무조건 write-back (updated 플래그 불필요)
-        if missing:
+        # 새로 계산한 ratio가 있을 때만 manifest 저장
+        if new_ratios_computed:
             manifest_path = self.patch_dir / 'manifest.json'
             with open(manifest_path, 'w', encoding='utf-8') as f:
                 json.dump(self.manifest, f, indent=2, ensure_ascii=False)
@@ -251,11 +253,7 @@ def skin_collate_fn(batch: list) -> dict:
     for key in ['rgb_cross', 'rgb_parallel', 'mask']:
         out[key] = torch.stack([b[key] for b in batch])
 
-    # bool 필드
-    for key in ['has_brown', 'has_red', 'has_wrinkle']:
-        out[key] = [b[key] for b in batch]   # list[bool]
-
-    # GT: None이 섞여 있을 수 있음 → None은 zeros_like로 대체, has_* 로 마스킹
+    # GT + has_* 플래그 (None은 zeros placeholder로 대체, loss 내부에서 has_*로 마스킹)
     for task in ['brown', 'red', 'wrinkle']:
         has_key = f'has_{task}'
         tensors = []
@@ -265,7 +263,7 @@ def skin_collate_fn(batch: list) -> dict:
             flags.append(t is not None)
             tensors.append(t if t is not None else
                            torch.zeros(1, b['mask'].shape[1], b['mask'].shape[2]))
-        out[task]   = torch.stack(tensors)          # [B,1,H,W]
+        out[task]    = torch.stack(tensors)          # [B,1,H,W]
         out[has_key] = flags                         # list[bool]
 
     out['stem'] = [b['stem'] for b in batch]
