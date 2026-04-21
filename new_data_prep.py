@@ -137,10 +137,13 @@ def generate_face_mask_v2(img_bgr: np.ndarray) -> np.ndarray:
     """
     mp = _try_import_mediapipe()
     if mp is not None:
-        mask = generate_face_mask_mediapipe_v2(img_bgr, mp.solutions.face_mesh)
-        if mask is not None:
-            return mask
-        print("    [WARN] MediaPipe 얼굴 검출 실패 -> ellipse fallback")
+        try:
+            mask = generate_face_mask_mediapipe_v2(img_bgr, mp.solutions.face_mesh)
+            if mask is not None:
+                return mask
+            print("    [WARN] MediaPipe 얼굴 검출 실패 -> ellipse fallback")
+        except Exception as e:
+            print(f"    [WARN] MediaPipe runtime failure ({e}) -> ellipse fallback")
 
     h, w = img_bgr.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
