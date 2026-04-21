@@ -111,16 +111,33 @@ class HighFreqGate(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-        F_shift = torch.fft.fftshift(torch.fft.fft2(x))
+        # FFT 경로는 mixed precision에서 complex half 경고 및 NaN을 유발할 수 있어
+        # autocast 밖에서 float32로 강제 계산한다.
+        if x.is_cuda:
+            with torch.cuda.amp.autocast(enabled=False):
+                x_fp32 = x.float()
+                F_shift = torch.fft.fftshift(torch.fft.fft2(x_fp32))
 
-        high_mask = self._radial_mask(H, W, self.high_r, 1.0, x.device)
-        gate_high = torch.sigmoid(self.high_logit)
+                high_mask = self._radial_mask(H, W, self.high_r, 1.0, x.device)
+                high_mask = high_mask.to(dtype=F_shift.dtype)
+                gate_high = torch.sigmoid(self.high_logit).float()
 
-        x_texture = torch.fft.ifft2(
-            torch.fft.ifftshift(F_shift * high_mask)
-        ).real * gate_high
+                x_texture = torch.fft.ifft2(
+                    torch.fft.ifftshift(F_shift * high_mask)
+                ).real * gate_high
+        else:
+            x_fp32 = x.float()
+            F_shift = torch.fft.fftshift(torch.fft.fft2(x_fp32))
 
-        return x_texture
+            high_mask = self._radial_mask(H, W, self.high_r, 1.0, x.device)
+            high_mask = high_mask.to(dtype=F_shift.dtype)
+            gate_high = torch.sigmoid(self.high_logit).float()
+
+            x_texture = torch.fft.ifft2(
+                torch.fft.ifftshift(F_shift * high_mask)
+            ).real * gate_high
+
+        return x_texture.to(dtype=x.dtype)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

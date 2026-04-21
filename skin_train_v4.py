@@ -38,6 +38,17 @@ CFG.update(
 )
 
 
+def _skin_result_to_fp32(result):
+    return result._replace(
+        brown_mask=result.brown_mask.float(),
+        brown_score=result.brown_score.float(),
+        red_mask=result.red_mask.float(),
+        red_score=result.red_score.float(),
+        wrinkle_mask=result.wrinkle_mask.float(),
+        wrinkle_score=result.wrinkle_score.float(),
+    )
+
+
 def _apply_illumination_aug_with_params(
     rgb: torch.Tensor,
     *,
@@ -183,7 +194,8 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, cfg, ep
         )
 
         # AMP Autocast 적용
-        with torch.cuda.amp.autocast():
+        amp_enabled = device.type == 'cuda'
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
             result = model(rgb_cross_aug, rgb_parallel_aug, mask)
 
             result_clean = None
@@ -192,28 +204,31 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, cfg, ep
                 model.eval()
                 with torch.no_grad():
                     # Consistency target 계산 시에도 FP16 적용으로 속도 향상
-                    with torch.cuda.amp.autocast():
+                    with torch.cuda.amp.autocast(enabled=amp_enabled):
                         result_clean = model(rgb_cross, rgb_parallel, mask)
                 if was_training:
                     model.train()
 
-            loss, detail = criterion(
-                result,
-                brown_gt, red_gt, wrinkle_gt,
+        result_for_loss = _skin_result_to_fp32(result)
+        result_clean_for_loss = _skin_result_to_fp32(result_clean) if result_clean is not None else None
+
+        loss, detail = criterion(
+                result_for_loss,
+                brown_gt.float(), red_gt.float(), wrinkle_gt.float(),
                 # [V4 변경점] 조명 강인성을 위해 recon target을 원본(clean) 이미지로 설정
-                rgb_cross=rgb_cross,
-                face_mask=mask,
+                rgb_cross=rgb_cross.float(),
+                face_mask=mask.float(),
                 has_brown=has_brown,
                 has_red=has_red,
                 has_wrinkle=has_wrinkle,
-                result_aug=result_clean,
+                result_aug=result_clean_for_loss,
                 model=None,
             )
 
-            if criterion.w_freq_reg > 0:
-                l_freq = base._v2_freq_reg(model)
-                loss = loss + criterion.w_freq_reg * l_freq
-                detail['freq_reg'] = l_freq.item()
+        if criterion.w_freq_reg > 0:
+            l_freq = base._v2_freq_reg(model).float()
+            loss = loss + criterion.w_freq_reg * l_freq
+            detail['freq_reg'] = l_freq.item()
 
         optimizer.zero_grad()
         # Scaler를 통한 역전파
