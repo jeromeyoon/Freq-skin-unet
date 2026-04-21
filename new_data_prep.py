@@ -164,6 +164,23 @@ def apply_mask_to_gray(gray_patch: np.ndarray, mask_patch: np.ndarray) -> np.nda
     return cv2.bitwise_and(gray_patch, gray_patch, mask=mask_patch)
 
 
+def select_negative_indices(
+    num_negative: int,
+    keep_count: int,
+) -> set[int]:
+    """
+    negative patch를 균등 간격으로 일부만 선택한다.
+    순차 추출 편향을 줄이기 위해 linspace 기반으로 고른다.
+    """
+    if keep_count <= 0 or num_negative <= 0:
+        return set()
+    if keep_count >= num_negative:
+        return set(range(num_negative))
+
+    idxs = np.linspace(0, num_negative - 1, num=keep_count, dtype=int)
+    return set(int(i) for i in idxs.tolist())
+
+
 def prepare(
     input_path: str,
     gt_path: str,
@@ -172,6 +189,8 @@ def prepare(
     stride: int = 256,
     min_mask_coverage: float = 0.7,
     apply_mask: bool = True,
+    neg_pos_ratio: float = 2.0,
+    max_negative_if_no_positive: int = 0,
 ) -> None:
     input_root = Path(input_path)
     gt_root = Path(gt_path)
@@ -231,8 +250,8 @@ def prepare(
             face_mask, patch_size, stride, min_mask_coverage
         )
 
-        saved = 0
-        for idx, (y, x) in enumerate(valid_positions):
+        patch_candidates = []
+        for y, x in valid_positions:
             c_p = crop_patch(cross_bgr, y, x, patch_size)
             p_p = crop_patch(parallel_bgr, y, x, patch_size)
             m_p = crop_patch(face_mask, y, x, patch_size)
@@ -241,23 +260,58 @@ def prepare(
                 c_p = apply_mask_to_rgb(c_p, m_p)
                 p_p = apply_mask_to_rgb(p_p, m_p)
 
-            stem = f"{subject_name}_{idx:04d}"
-
-            bgr2rgb_pil(c_p).save(out_root / "rgb_cross" / f"{stem}.png")
-            bgr2rgb_pil(p_p).save(out_root / "rgb_parallel" / f"{stem}.png")
-            Image.fromarray(m_p, mode="L").save(out_root / "mask" / f"{stem}.png")
-
             gt_pos_ratios = {}
+            is_positive = False
+            gt_patch_map = {}
             for task in ["brown", "red", "wrinkle"]:
                 if task in gt_arrays:
                     gt_patch = crop_patch(gt_arrays[task], y, x, patch_size)
                     if apply_mask:
                         gt_patch = apply_mask_to_gray(gt_patch, m_p)
-                    Image.fromarray(gt_patch, mode="L").save(
-                        out_root / task / f"{stem}.png"
-                    )
+                    gt_patch_map[task] = gt_patch
                     pos_ratio = float((gt_patch > 127).sum()) / gt_patch.size
                     gt_pos_ratios[f"{task}_pos_ratio"] = round(pos_ratio, 6)
+                    if pos_ratio > 0.0:
+                        is_positive = True
+
+            patch_candidates.append({
+                "y": y,
+                "x": x,
+                "cross": c_p,
+                "parallel": p_p,
+                "mask": m_p,
+                "gt_patch_map": gt_patch_map,
+                "gt_pos_ratios": gt_pos_ratios,
+                "is_positive": is_positive,
+            })
+
+        positives = [p for p in patch_candidates if p["is_positive"]]
+        negatives = [p for p in patch_candidates if not p["is_positive"]]
+
+        if positives:
+            neg_keep_count = min(len(negatives), int(np.ceil(len(positives) * neg_pos_ratio)))
+        else:
+            neg_keep_count = min(len(negatives), max_negative_if_no_positive)
+
+        neg_keep_indices = select_negative_indices(len(negatives), neg_keep_count)
+        selected_patches = positives + [
+            neg for i, neg in enumerate(negatives) if i in neg_keep_indices
+        ]
+
+        saved = 0
+        for idx, patch in enumerate(selected_patches):
+            y = patch["y"]
+            x = patch["x"]
+            stem = f"{subject_name}_{idx:04d}"
+
+            bgr2rgb_pil(patch["cross"]).save(out_root / "rgb_cross" / f"{stem}.png")
+            bgr2rgb_pil(patch["parallel"]).save(out_root / "rgb_parallel" / f"{stem}.png")
+            Image.fromarray(patch["mask"], mode="L").save(out_root / "mask" / f"{stem}.png")
+
+            for task, gt_patch in patch["gt_patch_map"].items():
+                Image.fromarray(gt_patch, mode="L").save(
+                    out_root / task / f"{stem}.png"
+                )
 
             manifest[stem] = {
                 "subject_name": subject_name,
@@ -267,12 +321,16 @@ def prepare(
                 "has_red": has_gt["red"],
                 "has_wrinkle": has_gt["wrinkle"],
                 "mask_applied": apply_mask,
-                **gt_pos_ratios,
+                "is_positive": patch["is_positive"],
+                **patch["gt_pos_ratios"],
             }
             saved += 1
             total_patches += 1
 
-        print(f"    -> {saved}개 패치 저장")
+        print(
+            f"    -> {saved}개 패치 저장 "
+            f"(positive={len(positives)}, negative_kept={neg_keep_count}/{len(negatives)})"
+        )
 
     manifest_path = out_root / "manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
@@ -306,6 +364,18 @@ if __name__ == "__main__":
         action="store_true",
         help="저장 시 RGB/GT에 얼굴 마스크를 적용하지 않음",
     )
+    parser.add_argument(
+        "--neg_pos_ratio",
+        type=float,
+        default=2.0,
+        help="negative patch를 positive patch 수의 몇 배까지 유지할지 지정 (기본 2.0)",
+    )
+    parser.add_argument(
+        "--max_negative_if_no_positive",
+        type=int,
+        default=0,
+        help="positive가 하나도 없을 때 유지할 negative patch 최대 개수 (기본 0)",
+    )
     args = parser.parse_args()
 
     prepare(
@@ -316,4 +386,6 @@ if __name__ == "__main__":
         stride=args.stride,
         min_mask_coverage=args.min_mask_coverage,
         apply_mask=not args.no_apply_mask,
+        neg_pos_ratio=args.neg_pos_ratio,
+        max_negative_if_no_positive=args.max_negative_if_no_positive,
     )
