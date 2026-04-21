@@ -210,52 +210,89 @@ def get_loss_weights(epoch:        int,
                      w_wrinkle:    float = 1.0,
                      w_recon:      float = 0.3) -> dict:
     """
-    단계별 loss 가중치 반환 (smooth 버전).
+    단계별 loss 가중치 반환 (curriculum + smooth auxiliary).
 
-    원본 대비 변경:
-      - w_freq_reg를 Phase 0부터 0.02로 적용 → FrequencyGate 조기 보호
-      - Phase 2/3 진입 시 warm-up 구간(7%) 동안 선형 증가 → 급격한 loss 점프 방지
+    난이도 가정:
+      - brown   : 가장 쉬움
+      - red     : 중간
+      - wrinkle : 가장 어려움
 
-    Phase 스케줄:
-      [0%, 20%)    Phase 0 : supervised only, w_recon=0, w_freq_reg=0.02
-      [20%, 40%)   Phase 1 : + recon(0.3),   w_freq_reg=0.02
-      [40%, 47%)   Phase 2 warm-up: consist 0→0.3 선형 증가
-      [47%, 80%)   Phase 2 stable: consist=0.3
-      [80%, 87%)   Phase 3 warm-up: freq_reg 0.02→0.1 선형 증가
-      [87%, 100%)  Phase 3 stable: freq_reg=0.1
+    Curriculum 철학:
+      - 초반(0~20%)  : brown 중심으로 안정 수렴
+      - 중반(20~50%): brown → red/wrinkle로 점진 이동
+      - 후반(50~80%): wrinkle 강화 시작
+      - 말기(80~100%): wrinkle 집중 미세 조정
+
+    Auxiliary 스케줄은 smooth 버전 철학 유지:
+      [0%, 20%)    supervised only, w_recon=0, w_freq_reg=0.02
+      [20%, 40%)   + recon(0.3),   w_freq_reg=0.02
+      [40%, 47%)   consistency 0→0.3 선형 증가
+      [47%, 80%)   consistency=0.3
+      [80%, 87%)   freq_reg 0.02→0.1 선형 증가
+      [87%, 100%)  freq_reg=0.1
     """
     progress = epoch / max(total_epochs, 1)
 
-    base = dict(
-        w_brown   = w_brown,
-        w_red     = w_red,
-        w_wrinkle = w_wrinkle,
-        w_recon   = w_recon,
+    # ── task curriculum ────────────────────────────────────────────────────
+    if progress < 0.20:
+        task = dict(
+            w_brown   = w_brown * 1.4,
+            w_red     = w_red * 0.8,
+            w_wrinkle = w_wrinkle * 0.4,
+        )
+    elif progress < 0.50:
+        t = (progress - 0.20) / 0.30
+        task = dict(
+            w_brown   = _lerp(w_brown * 1.4,      w_brown * 1.0, t),
+            w_red     = _lerp(w_red * 0.8,        w_red * 1.0,   t),
+            w_wrinkle = _lerp(w_wrinkle * 0.4,    w_wrinkle * 0.9, t),
+        )
+    elif progress < 0.80:
+        t = (progress - 0.50) / 0.30
+        task = dict(
+            w_brown   = _lerp(w_brown * 1.0,      w_brown * 0.85, t),
+            w_red     = _lerp(w_red * 1.0,        w_red * 1.05,   t),
+            w_wrinkle = _lerp(w_wrinkle * 0.9,    w_wrinkle * 1.3, t),
+        )
+    else:
+        t = (progress - 0.80) / 0.20
+        task = dict(
+            w_brown   = _lerp(w_brown * 0.85,     w_brown * 0.75, t),
+            w_red     = _lerp(w_red * 1.05,       w_red * 1.0,    t),
+            w_wrinkle = _lerp(w_wrinkle * 1.3,    w_wrinkle * 1.5, t),
+        )
+
+    # ── auxiliary curriculum ───────────────────────────────────────────────
+    base_aux = dict(
+        w_recon    = w_recon,
         w_consist  = 0.0,
-        w_freq_reg = 0.02,   # Phase 0~1: 소량 freq_reg → gate 조기 보호
+        w_freq_reg = 0.02,
     )
 
     # Phase 0: supervised only (recon off)
     if progress < 0.20:
-        return {**base, 'w_recon': 0.0}
+        aux = {**base_aux, 'w_recon': 0.0}
 
     # Phase 1: supervised + recon
-    if progress < 0.40:
-        return base
+    elif progress < 0.40:
+        aux = base_aux
 
     # Phase 2 warm-up (40~47%): consistency 선형 증가
-    if progress < 0.47:
+    elif progress < 0.47:
         t = (progress - 0.40) / 0.07          # 0→1
-        return {**base, 'w_consist': _lerp(0.0, 0.3, t)}
+        aux = {**base_aux, 'w_consist': _lerp(0.0, 0.3, t)}
 
     # Phase 2 stable (47~80%)
-    if progress < 0.80:
-        return {**base, 'w_consist': 0.3}
+    elif progress < 0.80:
+        aux = {**base_aux, 'w_consist': 0.3}
 
     # Phase 3 warm-up (80~87%): freq_reg 선형 증가
-    if progress < 0.87:
+    elif progress < 0.87:
         t = (progress - 0.80) / 0.07          # 0→1
-        return {**base, 'w_consist': 0.3, 'w_freq_reg': _lerp(0.02, 0.1, t)}
+        aux = {**base_aux, 'w_consist': 0.3, 'w_freq_reg': _lerp(0.02, 0.1, t)}
 
     # Phase 3 stable (87~100%)
-    return {**base, 'w_consist': 0.3, 'w_freq_reg': 0.1}
+    else:
+        aux = {**base_aux, 'w_consist': 0.3, 'w_freq_reg': 0.1}
+
+    return {**task, **aux}
