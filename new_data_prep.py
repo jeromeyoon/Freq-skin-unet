@@ -110,6 +110,11 @@ def generate_face_mask_mediapipe_v2(
         excl = cv2.dilate(excl, k_dilate, iterations=1)
         mask = cv2.bitwise_and(mask, cv2.bitwise_not(excl))
 
+    # 목 제거: 턱 끝 landmark(152) 아래는 잘라낸다.
+    chin_y = int(lm[152].y * h)
+    neck_cut_y = min(h, chin_y + max(4, int(h * 0.015)))
+    mask[neck_cut_y:, :] = 0
+
     return mask
 
 
@@ -126,9 +131,13 @@ def generate_face_mask_v2(img_bgr: np.ndarray) -> np.ndarray:
 
     h, w = img_bgr.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
-    cx, cy = w // 2, int(h * 0.45)
-    axes = (int(w * 0.35), int(h * 0.40))
+    cx, cy = w // 2, int(h * 0.43)
+    axes = (int(w * 0.33), int(h * 0.36))
     cv2.ellipse(mask, (cx, cy), axes, 0, 0, 360, 255, -1)
+
+    # fallback에서도 목/하부 배경이 섞이지 않도록 하단을 한 번 더 절단
+    neck_cut_y = min(h, cy + int(axes[1] * 0.78))
+    mask[neck_cut_y:, :] = 0
     return mask
 
 
