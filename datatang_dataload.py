@@ -17,18 +17,18 @@ Input images:
 GT masks:
     gt_root/
         brownspots/
-            images/
+            annotations/
                 sr-proto/
-                    ID001.jpg
-                    ID002.jpg
+                    ID001.png
+                    ID002.png
         red/
-            images/
+            annotations/
                 sr-proto/
-                    ID001.jpg
+                    ID001.png
         wrinkle-deep/
-            images/
+            annotations/
                 sr-proto/
-                    ID001.jpg
+                    ID001-F_11-gt.png
 
 Returned record format
 ----------------------
@@ -37,9 +37,9 @@ Returned record format
         'stem'        : 'ID001',
         'rgb_cross'   : Path('.../ID001/F10.jpg'),
         'rgb_parallel': Path('.../ID001/F_11.jpg'),
-        'brown'       : Path('.../brownspots/images/sr-proto/ID001.jpg') or None,
-        'red'         : Path('.../red/images/sr-proto/ID001.jpg') or None,
-        'wrinkle'     : Path('.../wrinkle-deep/images/sr-proto/ID001.jpg') or None,
+        'brown'       : Path('.../brownspots/annotations/sr-proto/ID001.png') or None,
+        'red'         : Path('.../red/annotations/sr-proto/ID001.png') or None,
+        'wrinkle'     : Path('.../wrinkle-deep/annotations/sr-proto/ID001-F_11-gt.png') or None,
         'has_brown'   : bool,
         'has_red'     : bool,
         'has_wrinkle' : bool,
@@ -53,10 +53,14 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def _resolve_task_gt_path(gt_root: Path | None, task_dir: str, stem: str, suffix: str) -> Path | None:
+def _resolve_task_gt_path(
+    gt_root: Path | None,
+    task_dir: str,
+    filename: str,
+) -> Path | None:
     if gt_root is None:
         return None
-    path = gt_root / task_dir / 'images' / 'sr-proto' / f'{stem}{suffix}'
+    path = gt_root / task_dir / 'annotations' / 'sr-proto' / filename
     return path if path.exists() else None
 
 
@@ -66,7 +70,8 @@ def build_file_list(
     *,
     cross_name: str = 'F10.jpg',
     parallel_name: str = 'F_11.jpg',
-    gt_suffix: str = '.jpg',
+    brown_red_suffix: str = '.png',
+    wrinkle_suffix: str = '-F_11-gt.png',
     brown_dir: str = 'brownspots',
     red_dir: str = 'red',
     wrinkle_dir: str = 'wrinkle-deep',
@@ -86,8 +91,10 @@ def build_file_list(
         Cross-polarization filename. Default: F10.jpg
     parallel_name:
         Parallel-polarization filename. Default: F_11.jpg
-    gt_suffix:
-        GT filename suffix. Default: .jpg
+    brown_red_suffix:
+        Brown/Red GT filename suffix. Default: .png
+    wrinkle_suffix:
+        Wrinkle GT filename suffix. Default: -F_11-gt.png
     brown_dir / red_dir / wrinkle_dir:
         Task directory names under gt_root.
     """
@@ -120,9 +127,9 @@ def build_file_list(
             skipped += 1
             continue
 
-        brown_path = _resolve_task_gt_path(gt_root, brown_dir, stem, gt_suffix)
-        red_path = _resolve_task_gt_path(gt_root, red_dir, stem, gt_suffix)
-        wrinkle_path = _resolve_task_gt_path(gt_root, wrinkle_dir, stem, gt_suffix)
+        brown_path = _resolve_task_gt_path(gt_root, brown_dir, f'{stem}{brown_red_suffix}')
+        red_path = _resolve_task_gt_path(gt_root, red_dir, f'{stem}{brown_red_suffix}')
+        wrinkle_path = _resolve_task_gt_path(gt_root, wrinkle_dir, f'{stem}{wrinkle_suffix}')
 
         records.append({
             'stem': stem,
@@ -163,7 +170,8 @@ if __name__ == '__main__':
     parser.add_argument('--gt_root', default=None, help='GT root path')
     parser.add_argument('--cross_name', default='F10.jpg')
     parser.add_argument('--parallel_name', default='F_11.jpg')
-    parser.add_argument('--gt_suffix', default='.jpg')
+    parser.add_argument('--brown_red_suffix', default='.png')
+    parser.add_argument('--wrinkle_suffix', default='-F_11-gt.png')
     parser.add_argument('--brown_dir', default='brownspots')
     parser.add_argument('--red_dir', default='red')
     parser.add_argument('--wrinkle_dir', default='wrinkle-deep')
@@ -175,7 +183,8 @@ if __name__ == '__main__':
         gt_root=args.gt_root,
         cross_name=args.cross_name,
         parallel_name=args.parallel_name,
-        gt_suffix=args.gt_suffix,
+        brown_red_suffix=args.brown_red_suffix,
+        wrinkle_suffix=args.wrinkle_suffix,
         brown_dir=args.brown_dir,
         red_dir=args.red_dir,
         wrinkle_dir=args.wrinkle_dir,
