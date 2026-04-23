@@ -298,6 +298,35 @@ def add_red_curr_aliases(red_gt_map: dict[str, Path]) -> dict[str, Path]:
     return out
 
 
+def add_wrinkle_f11_aliases(wrinkle_gt_map: dict[str, Path]) -> dict[str, Path]:
+    """
+    Add aliases for wrinkle masks whose filename includes the F_11 GT suffix.
+
+    Examples
+    --------
+    ID-F_11-gt.png -> ID
+    ID_F_11_gt.png -> ID
+    """
+    out = dict(wrinkle_gt_map)
+    suffixes = (
+        "-F_11-gt",
+        "_F_11_gt",
+        "-F11-gt",
+        "_F11_gt",
+        "-f_11-gt",
+        "_f_11_gt",
+        "-f11-gt",
+        "_f11_gt",
+    )
+    for stem, path in wrinkle_gt_map.items():
+        for suffix in suffixes:
+            if stem.endswith(suffix):
+                alias = stem[: -len(suffix)].rstrip("_- ")
+                if alias:
+                    out.setdefault(alias, path)
+    return out
+
+
 def generate_task_centered_positions(
     gt_array: np.ndarray,
     face_mask: np.ndarray,
@@ -465,11 +494,15 @@ def process_subject(
         for task in ["brown", "red", "wrinkle"]:
             if task in gt_arrays:
                 gt_patch = crop_patch(gt_arrays[task], y, x, patch_size)
-                if apply_mask:
-                    gt_patch = apply_mask_to_gray(gt_patch, m_p)
+                gt_patch_for_ratio = (
+                    apply_mask_to_gray(gt_patch, m_p) if apply_mask else gt_patch
+                )
+                # Save raw GT crop so patch GT remains visually comparable with
+                # the original annotation. The training loss still applies
+                # face_mask, and sampling ratios are computed on the masked ROI.
                 gt_patch_map[task] = gt_patch
 
-                pos_ratio = float((gt_patch > 127).sum()) / gt_patch.size
+                pos_ratio = float((gt_patch_for_ratio > 127).sum()) / gt_patch_for_ratio.size
                 gt_pos_ratios[f"{task}_pos_ratio"] = round(pos_ratio, 6)
                 task_positive[task] = pos_ratio > 0.0
                 if pos_ratio > 0.0:
@@ -620,6 +653,7 @@ def prepare(
 
     gt_maps = {task: build_gt_id_map(gt_root, task) for task in GT_SUBDIRS}
     gt_maps["red"] = add_red_curr_aliases(gt_maps["red"])
+    gt_maps["wrinkle"] = add_wrinkle_f11_aliases(gt_maps["wrinkle"])
     print(
         f"GT ID 수: brown={len(gt_maps['brown'])}, "
         f"red={len(gt_maps['red'])}, wrinkle={len(gt_maps['wrinkle'])}"
