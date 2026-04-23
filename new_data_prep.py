@@ -249,6 +249,55 @@ def add_red_curr_aliases(red_gt_map: dict[str, Path]) -> dict[str, Path]:
     return out
 
 
+def generate_task_centered_positions(
+    gt_array: np.ndarray,
+    face_mask: np.ndarray,
+    patch_size: int,
+    max_patches: int,
+    jitter: int,
+    min_mask_coverage: float,
+    rng: np.random.Generator,
+) -> list[tuple[int, int]]:
+    """
+    Generate extra patch positions centered around sparse task-positive pixels.
+
+    This augments the regular sliding-window candidates and directly addresses
+    sparse labels such as red curr masks and wrinkle lines.
+    """
+    if max_patches <= 0:
+        return []
+
+    h, w = gt_array.shape[:2]
+    if h < patch_size or w < patch_size:
+        return []
+
+    positive = np.argwhere((gt_array > 127) & (face_mask > 127))
+    if len(positive) == 0:
+        return []
+
+    replace = len(positive) < max_patches
+    sample_count = max_patches if replace else min(max_patches, len(positive))
+    chosen = rng.choice(len(positive), size=sample_count, replace=replace)
+
+    positions: set[tuple[int, int]] = set()
+    face_binary = face_mask > 127
+
+    for idx in chosen:
+        cy, cx = positive[int(idx)]
+        if jitter > 0:
+            cy = int(cy + rng.integers(-jitter, jitter + 1))
+            cx = int(cx + rng.integers(-jitter, jitter + 1))
+
+        y = int(np.clip(cy - patch_size // 2, 0, h - patch_size))
+        x = int(np.clip(cx - patch_size // 2, 0, w - patch_size))
+
+        patch_mask = face_binary[y:y + patch_size, x:x + patch_size]
+        if patch_mask.mean() >= min_mask_coverage:
+            positions.add((y, x))
+
+    return sorted(positions)
+
+
 def prepare(
     input_path: str,
     gt_path: str,
@@ -262,6 +311,11 @@ def prepare(
     wrinkle_min_pos_ratio: float = 1e-5,
     wrinkle_neg_pos_ratio: float = 2.0,
     max_wrinkle_negative_if_no_positive: int = 0,
+    centered_tasks: tuple[str, ...] = ("red", "wrinkle"),
+    centered_patches_per_task: int = 128,
+    centered_jitter: int = 64,
+    centered_min_mask_coverage: float = 0.5,
+    centered_seed: int = 42,
     disable_mediapipe: bool = False,
     face_landmarker_task_path: str | None = None,
 ) -> None:
@@ -285,6 +339,7 @@ def prepare(
     manifest: dict[str, dict] = {}
     total_patches = 0
     skipped_ids: list[str] = []
+    rng = np.random.default_rng(centered_seed)
 
     mp = None
     landmarker = None
@@ -331,6 +386,28 @@ def prepare(
             valid_positions = find_valid_positions(
                 face_mask, patch_size, stride, min_mask_coverage
             )
+            position_set = set(valid_positions)
+            centered_counts: dict[str, int] = {}
+            for task in centered_tasks:
+                if task not in gt_arrays:
+                    centered_counts[task] = 0
+                    continue
+                extra_positions = generate_task_centered_positions(
+                    gt_array=gt_arrays[task],
+                    face_mask=face_mask,
+                    patch_size=patch_size,
+                    max_patches=centered_patches_per_task,
+                    jitter=centered_jitter,
+                    min_mask_coverage=centered_min_mask_coverage,
+                    rng=rng,
+                )
+                added = 0
+                for pos in extra_positions:
+                    if pos not in position_set:
+                        valid_positions.append(pos)
+                        position_set.add(pos)
+                        added += 1
+                centered_counts[task] = added
 
             patch_candidates = []
             for y, x in valid_positions:
@@ -459,6 +536,7 @@ def prepare(
             print(
                 f"    -> {saved}개 패치 저장 "
                 f"(positive={len(positives)}, negative_kept={neg_keep_count}/{len(negatives)}, "
+                f"centered={centered_counts}, "
                 f"wrinkle_pos={len(wrinkle_positives)}, "
                 f"wrinkle_neg_kept={wrinkle_neg_keep_count}/{len(wrinkle_negatives)})"
             )
@@ -529,6 +607,35 @@ if __name__ == "__main__":
         help="wrinkle positive가 없을 때 유지할 wrinkle negative 최대 개수 (기본 0)",
     )
     parser.add_argument(
+        "--centered_tasks",
+        default="red,wrinkle",
+        help="희소 GT 중심 patch를 추가할 task 목록 (기본: red,wrinkle)",
+    )
+    parser.add_argument(
+        "--centered_patches_per_task",
+        type=int,
+        default=128,
+        help="ID당 task별 positive-centered patch 후보 최대 개수 (기본 128)",
+    )
+    parser.add_argument(
+        "--centered_jitter",
+        type=int,
+        default=64,
+        help="positive-centered crop 중심 jitter 픽셀 범위 (기본 64)",
+    )
+    parser.add_argument(
+        "--centered_min_mask_coverage",
+        type=float,
+        default=0.5,
+        help="centered patch의 최소 얼굴 mask coverage (기본 0.5)",
+    )
+    parser.add_argument(
+        "--centered_seed",
+        type=int,
+        default=42,
+        help="positive-centered patch sampling seed (기본 42)",
+    )
+    parser.add_argument(
         "--disable_mediapipe",
         action="store_true",
         help="MediaPipe를 사용하지 않고 fallback 얼굴 마스크만 사용",
@@ -554,6 +661,13 @@ if __name__ == "__main__":
         wrinkle_min_pos_ratio=args.wrinkle_min_pos_ratio,
         wrinkle_neg_pos_ratio=args.wrinkle_neg_pos_ratio,
         max_wrinkle_negative_if_no_positive=args.max_wrinkle_negative_if_no_positive,
+        centered_tasks=tuple(
+            task.strip() for task in args.centered_tasks.split(",") if task.strip()
+        ),
+        centered_patches_per_task=args.centered_patches_per_task,
+        centered_jitter=args.centered_jitter,
+        centered_min_mask_coverage=args.centered_min_mask_coverage,
+        centered_seed=args.centered_seed,
         disable_mediapipe=args.disable_mediapipe,
         face_landmarker_task_path=args.face_landmarker_task_path,
     )
