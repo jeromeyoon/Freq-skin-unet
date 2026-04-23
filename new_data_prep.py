@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import threading
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -397,6 +398,7 @@ def process_subject(
     centered_seed: int,
     disable_mediapipe: bool,
     face_landmarker_task_path: str | None,
+    max_patches_per_subject: int | None = None,
 ) -> dict:
     """
     Process one subject directory and save its patch files.
@@ -573,6 +575,17 @@ def process_subject(
             selected_patches.append(p)
             selected_ids.add(id(p))
 
+    pre_save_dropped = 0
+    if max_patches_per_subject and max_patches_per_subject > 0:
+        if len(selected_patches) > max_patches_per_subject:
+            ranked_patches = sorted(
+                selected_patches,
+                key=_patch_candidate_quality_score,
+                reverse=True,
+            )
+            pre_save_dropped = len(selected_patches) - max_patches_per_subject
+            selected_patches = ranked_patches[:max_patches_per_subject]
+
     saved = 0
     for idx, patch in enumerate(selected_patches):
         y = patch["y"]
@@ -609,7 +622,8 @@ def process_subject(
         f"(positive={len(positives)}, negative_kept={neg_keep_count}/{len(negatives)}, "
         f"centered={centered_counts}, "
         f"wrinkle_pos={len(wrinkle_positives)}, "
-        f"wrinkle_neg_kept={wrinkle_neg_keep_count}/{len(wrinkle_negatives)})"
+        f"wrinkle_neg_kept={wrinkle_neg_keep_count}/{len(wrinkle_negatives)}, "
+        f"pre_save_dropped={pre_save_dropped})"
     )
 
     return {
@@ -620,6 +634,128 @@ def process_subject(
         "manifest": subject_manifest,
         "logs": logs,
     }
+
+
+def _quality_score(info: dict) -> tuple:
+    """
+    Rank "better" patches first.
+
+    Priority:
+    1. wrinkle-positive sparse supervision
+    2. multi-task positive patches
+    3. red-positive patches
+    4. brown-positive patches
+    5. larger masked positive ratios
+    6. earlier patch index as a stable tie-break
+    """
+    wrinkle_ratio = float(info.get("wrinkle_pos_ratio", 0.0))
+    red_ratio = float(info.get("red_pos_ratio", 0.0))
+    brown_ratio = float(info.get("brown_pos_ratio", 0.0))
+
+    wrinkle_pos = int(info.get("is_wrinkle_positive", False))
+    red_pos = int(red_ratio > 0.0)
+    brown_pos = int(brown_ratio > 0.0)
+    positive_task_count = wrinkle_pos + red_pos + brown_pos
+    is_positive = int(info.get("is_positive", False))
+
+    return (
+        wrinkle_pos,
+        positive_task_count,
+        red_pos,
+        brown_pos,
+        min(wrinkle_ratio, 1.0),
+        min(red_ratio, 1.0),
+        min(brown_ratio, 1.0),
+        is_positive,
+        -int(info.get("patch_idx", 0)),
+    )
+
+
+def _patch_candidate_quality_score(patch: dict) -> tuple:
+    wrinkle_ratio = float(patch["gt_pos_ratios"].get("wrinkle_pos_ratio", 0.0))
+    red_ratio = float(patch["gt_pos_ratios"].get("red_pos_ratio", 0.0))
+    brown_ratio = float(patch["gt_pos_ratios"].get("brown_pos_ratio", 0.0))
+
+    wrinkle_pos = int(wrinkle_ratio > 0.0)
+    red_pos = int(red_ratio > 0.0)
+    brown_pos = int(brown_ratio > 0.0)
+    positive_task_count = wrinkle_pos + red_pos + brown_pos
+    is_positive = int(patch.get("is_positive", False))
+
+    return (
+        wrinkle_pos,
+        positive_task_count,
+        red_pos,
+        brown_pos,
+        min(wrinkle_ratio, 1.0),
+        min(red_ratio, 1.0),
+        min(brown_ratio, 1.0),
+        is_positive,
+    )
+
+
+def prune_saved_patches(
+    manifest: dict[str, dict],
+    out_root: Path,
+    max_total_patches: int | None,
+    max_patches_per_subject: int | None,
+) -> dict[str, dict]:
+    """
+    Keep only the highest-quality saved patches and delete the rest from disk.
+
+    This runs after patch generation, which keeps the worker logic simple and
+    allows a global quality-based selection across all subjects.
+    """
+    if not max_total_patches or max_total_patches <= 0:
+        return manifest
+    if len(manifest) <= max_total_patches:
+        return manifest
+
+    ranked = sorted(
+        manifest.items(),
+        key=lambda kv: (_quality_score(kv[1]), kv[0]),
+        reverse=True,
+    )
+
+    keep: dict[str, dict] = {}
+    deferred: list[tuple[str, dict]] = []
+    subject_counts: dict[str, int] = defaultdict(int)
+    subject_cap = None
+    if max_patches_per_subject and max_patches_per_subject > 0:
+        subject_cap = int(max_patches_per_subject)
+
+    for stem, info in ranked:
+        subject = str(info.get("subject_name", ""))
+        if subject_cap is not None and subject_counts[subject] >= subject_cap:
+            deferred.append((stem, info))
+            continue
+        if len(keep) < max_total_patches:
+            keep[stem] = info
+            subject_counts[subject] += 1
+        else:
+            deferred.append((stem, info))
+
+    for stem, info in deferred:
+        if len(keep) >= max_total_patches:
+            break
+        subject = str(info.get("subject_name", ""))
+        keep[stem] = info
+        subject_counts[subject] += 1
+
+    drop_stems = set(manifest.keys()) - set(keep.keys())
+    for stem in drop_stems:
+        for sub in ("rgb_cross", "rgb_parallel", "brown", "red", "wrinkle", "mask"):
+            path = out_root / sub / f"{stem}.png"
+            if path.exists():
+                path.unlink()
+
+    print(
+        "[quality-prune] "
+        f"kept={len(keep)}/{len(manifest)} "
+        f"(max_total_patches={max_total_patches}, "
+        f"max_patches_per_subject={subject_cap if subject_cap is not None else 'off'})"
+    )
+    return keep
 
 
 def prepare(
@@ -643,6 +779,8 @@ def prepare(
     disable_mediapipe: bool = False,
     face_landmarker_task_path: str | None = None,
     num_workers: int = 1,
+    max_total_patches: int = 2000,
+    max_patches_per_subject: int = 12,
 ) -> None:
     input_root = Path(input_path)
     gt_root = Path(gt_path)
@@ -688,6 +826,7 @@ def prepare(
         centered_seed=centered_seed,
         disable_mediapipe=disable_mediapipe,
         face_landmarker_task_path=face_landmarker_task_path,
+        max_patches_per_subject=max_patches_per_subject,
     )
 
     results: list[dict | None] = [None] * len(subject_dirs)
@@ -729,6 +868,14 @@ def prepare(
             continue
         manifest.update(result["manifest"])
         total_patches += int(result["saved"])
+
+    manifest = prune_saved_patches(
+        manifest=manifest,
+        out_root=out_root,
+        max_total_patches=max_total_patches,
+        max_patches_per_subject=max_patches_per_subject,
+    )
+    total_patches = len(manifest)
 
     manifest_path = out_root / "manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
@@ -1060,6 +1207,18 @@ if __name__ == "__main__":
         default=1,
         help="ID 단위 병렬 처리 worker 수 (기본 1, 예: 4)",
     )
+    parser.add_argument(
+        "--max_total_patches",
+        type=int,
+        default=2000,
+        help="최종적으로 유지할 총 patch 수 상한 (기본 2000, 0 이하면 제한 없음)",
+    )
+    parser.add_argument(
+        "--max_patches_per_subject",
+        type=int,
+        default=12,
+        help="한 subject에서 유지할 patch 최대 수 (기본 12, 0 이하면 제한 없음)",
+    )
     args = parser.parse_args()
 
     prepare(
@@ -1085,4 +1244,6 @@ if __name__ == "__main__":
         disable_mediapipe=args.disable_mediapipe,
         face_landmarker_task_path=args.face_landmarker_task_path,
         num_workers=args.num_workers,
+        max_total_patches=args.max_total_patches,
+        max_patches_per_subject=args.max_patches_per_subject,
     )
