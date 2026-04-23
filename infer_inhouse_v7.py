@@ -14,14 +14,19 @@ import argparse
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+import torchvision.utils as vutils
 
 from in_house_dataload import build_file_list
 from infer_inhouse import (
+    _load_gt_aligned,
     _print_summary,
     _save_dice_summary,
     _save_scores_json,
-    run_inhouse_infer,
 )
+from skin_infer import compute_dice, infer_single, load_rgb_full, save_visualization
+from skin_mask_gen import generate_skin_mask
 from skin_net_v2 import build_analyzer_v2
 
 
@@ -98,6 +103,74 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _normalize_vis(x: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize a tensor for visualization.
+    Accepts [1,H,W] or [3,H,W] and returns [3,H,W].
+    """
+    if x.dim() != 3:
+        raise ValueError(f"Expected 3D tensor [C,H,W], got shape={tuple(x.shape)}")
+
+    if x.shape[0] == 1:
+        x = x.repeat(3, 1, 1)
+    elif x.shape[0] > 3:
+        x = x[:3]
+
+    x = x.float()
+    x_min = x.amin(dim=(1, 2), keepdim=True)
+    x_max = x.amax(dim=(1, 2), keepdim=True)
+    return ((x - x_min) / (x_max - x_min + 1e-6)).clamp(0.0, 1.0)
+
+
+@torch.no_grad()
+def extract_illumination_diagnostics(
+    model,
+    rgb_cross_full: torch.Tensor,
+    rgb_parallel_full: torch.Tensor,
+    device: torch.device,
+) -> dict:
+    """
+    Extract intermediate representations useful for checking whether
+    ambient illumination has been suppressed.
+    """
+    cross = rgb_cross_full.unsqueeze(0).to(device)
+    parallel = rgb_parallel_full.unsqueeze(0).to(device)
+
+    eps = getattr(model.cross_encoder, 'eps', 1e-3)
+    od = -torch.log(cross.clamp(min=eps, max=1.0)).clamp(-6.0, 6.0)
+    od_chroma = model.cross_encoder.od_filter(od)
+    parallel_pre = model.parallel_encoder.preprocess(parallel)
+
+    return {
+        'cross_rgb': rgb_cross_full.cpu(),
+        'cross_od_chroma': od_chroma[0].cpu(),
+        'parallel_rgb': rgb_parallel_full.cpu(),
+        'parallel_preprocess': parallel_pre[0].cpu(),
+    }
+
+
+def save_illumination_diagnostics(diag: dict, save_path: Path, max_vis_size: int = 1024) -> None:
+    items = [
+        _normalize_vis(diag['cross_rgb']),
+        _normalize_vis(diag['cross_od_chroma']),
+        _normalize_vis(diag['parallel_rgb']),
+        _normalize_vis(diag['parallel_preprocess']),
+    ]
+
+    resized = []
+    for x in items:
+        h = x.shape[1]
+        if h > max_vis_size:
+            scale = max_vis_size / h
+            new_h = max_vis_size
+            new_w = max(1, int(x.shape[2] * scale))
+            x = F.interpolate(x.unsqueeze(0), (new_h, new_w), mode='bilinear', align_corners=False).squeeze(0)
+        resized.append(x)
+
+    grid = vutils.make_grid(torch.stack(resized), nrow=4, padding=2, normalize=False)
+    TF.to_pil_image(grid).save(save_path)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -127,20 +200,103 @@ def main() -> None:
     patch_batch_size = int(args.patch_batch_size)
 
     print("Running inference...")
-    all_scores = run_inhouse_infer(
-        records=records,
-        model=model,
-        out_dir=out_dir,
-        device=device,
-        img_size=img_size,
-        patch_size=patch_size,
-        overlap=overlap,
-        patch_batch_size=patch_batch_size,
-        save_vis=args.save_vis,
-        save_masks=args.save_masks,
-        mask_threshold=args.mask_threshold,
-        use_mediapipe=not args.no_mediapipe,
-    )
+
+    vis_dir = out_dir / 'visualizations'
+    mask_dir = out_dir / 'masks'
+    illum_dir = out_dir / 'illumination_diagnostics'
+
+    if args.save_vis:
+        vis_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_masks:
+        for tag in ('skin', 'brown', 'red', 'wrinkle'):
+            (mask_dir / tag).mkdir(parents=True, exist_ok=True)
+    illum_dir.mkdir(parents=True, exist_ok=True)
+
+    all_scores = []
+
+    for rec in records:
+        stem = rec['stem']
+        cross_path = rec['rgb_cross']
+        parallel_path = rec['rgb_parallel']
+
+        print(f"Infer: {stem}")
+
+        rgb_full = load_rgb_full(cross_path)
+        skin_mask = generate_skin_mask(
+            rgb_full,
+            use_mediapipe=not args.no_mediapipe,
+        )
+
+        pred = infer_single(
+            model=model,
+            cross_path=cross_path,
+            parallel_path=parallel_path,
+            img_size=img_size,
+            device=device,
+            skin_mask=skin_mask,
+            patch_size=patch_size,
+            overlap=overlap,
+            patch_batch_size=patch_batch_size,
+        )
+
+        brown_prob = pred['brown_mask']
+        red_prob = pred['red_mask']
+        wrinkle_prob = pred['wrinkle_mask']
+        h, w = brown_prob.shape[1], brown_prob.shape[2]
+
+        dice: dict[str, float | None] = {}
+        pred_key_map = {'brown': brown_prob, 'red': red_prob, 'wrinkle': wrinkle_prob}
+        for task in ('brown', 'red', 'wrinkle'):
+            gt_path = rec[task]
+            if gt_path is not None:
+                gt_tensor = _load_gt_aligned(gt_path, h, w)
+                dice[task] = compute_dice(pred_key_map[task], gt_tensor, skin_mask=skin_mask)
+            else:
+                dice[task] = None
+
+        if args.save_vis:
+            save_visualization(
+                rgb_cross=pred['rgb_cross'],
+                brown_prob=brown_prob,
+                red_prob=red_prob,
+                wrinkle_prob=wrinkle_prob,
+                save_path=vis_dir / f'{stem}_vis.png',
+                brown_score=pred['brown_score'],
+                red_score=pred['red_score'],
+                wrinkle_score=pred['wrinkle_score'],
+            )
+
+        if args.save_masks:
+            if skin_mask.shape[1] != h or skin_mask.shape[2] != w:
+                skin_save = F.interpolate(skin_mask.unsqueeze(0), (h, w), mode='nearest').squeeze(0)
+            else:
+                skin_save = skin_mask
+            TF.to_pil_image(skin_save).save(mask_dir / 'skin' / f'{stem}.png')
+            TF.to_pil_image((brown_prob >= args.mask_threshold).float()).save(mask_dir / 'brown' / f'{stem}.png')
+            TF.to_pil_image((red_prob >= args.mask_threshold).float()).save(mask_dir / 'red' / f'{stem}.png')
+            TF.to_pil_image((wrinkle_prob >= args.mask_threshold).float()).save(mask_dir / 'wrinkle' / f'{stem}.png')
+
+        rgb_parallel_full = load_rgb_full(parallel_path)
+        diag = extract_illumination_diagnostics(
+            model=model,
+            rgb_cross_full=rgb_full,
+            rgb_parallel_full=rgb_parallel_full,
+            device=device,
+        )
+        save_illumination_diagnostics(
+            diag,
+            illum_dir / f'{stem}_illum.png',
+        )
+
+        all_scores.append({
+            'stem': stem,
+            'brown_score': round(pred['brown_score'], 4),
+            'red_score': round(pred['red_score'], 4),
+            'wrinkle_score': round(pred['wrinkle_score'], 4),
+            'brown_dice': round(dice['brown'], 4) if dice['brown'] is not None else None,
+            'red_dice': round(dice['red'], 4) if dice['red'] is not None else None,
+            'wrinkle_dice': round(dice['wrinkle'], 4) if dice['wrinkle'] is not None else None,
+        })
 
     print("Saving reports...")
     _save_scores_json(all_scores, out_dir / 'scores.json')
