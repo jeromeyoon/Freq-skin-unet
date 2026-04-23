@@ -153,6 +153,8 @@ def generate_face_mask_tasks(
         excl = cv2.dilate(excl, k_dilate, iterations=1)
         mask = cv2.bitwise_and(mask, cv2.bitwise_not(excl))
 
+    return mask
+
     # jawline 아래를 제거해서 목 제외
     jaw_pts = lm_pts(_JAWLINE)
     jaw_cut = np.vstack([
@@ -226,6 +228,27 @@ def select_negative_indices(num_negative: int, keep_count: int) -> set[int]:
     return set(int(i) for i in idxs.tolist())
 
 
+def add_red_curr_aliases(red_gt_map: dict[str, Path]) -> dict[str, Path]:
+    """
+    Add aliases for red GT files whose filename ends with curr.
+
+    Examples
+    --------
+    ID_curr.png  -> ID
+    ID-curr.png  -> ID
+    IDcurr.png   -> ID
+    """
+    out = dict(red_gt_map)
+    for stem, path in red_gt_map.items():
+        lower = stem.lower()
+        for suffix in ("_curr", "-curr", " curr", "curr"):
+            if lower.endswith(suffix):
+                alias = stem[: -len(suffix)].rstrip("_- ")
+                if alias:
+                    out.setdefault(alias, path)
+    return out
+
+
 def prepare(
     input_path: str,
     gt_path: str,
@@ -236,6 +259,9 @@ def prepare(
     apply_mask: bool = True,
     neg_pos_ratio: float = 2.0,
     max_negative_if_no_positive: int = 0,
+    wrinkle_min_pos_ratio: float = 1e-5,
+    wrinkle_neg_pos_ratio: float = 2.0,
+    max_wrinkle_negative_if_no_positive: int = 0,
     disable_mediapipe: bool = False,
     face_landmarker_task_path: str | None = None,
 ) -> None:
@@ -247,6 +273,7 @@ def prepare(
         (out_root / sub).mkdir(parents=True, exist_ok=True)
 
     gt_maps = {task: build_gt_id_map(gt_root, task) for task in GT_SUBDIRS}
+    gt_maps["red"] = add_red_curr_aliases(gt_maps["red"])
     print(
         f"GT ID 수: brown={len(gt_maps['brown'])}, "
         f"red={len(gt_maps['red'])}, wrinkle={len(gt_maps['wrinkle'])}"
@@ -316,6 +343,7 @@ def prepare(
                     p_p = apply_mask_to_rgb(p_p, m_p)
 
                 gt_pos_ratios = {}
+                task_positive = {}
                 is_positive = False
                 gt_patch_map = {}
                 for task in ["brown", "red", "wrinkle"]:
@@ -327,6 +355,7 @@ def prepare(
 
                         pos_ratio = float((gt_patch > 127).sum()) / gt_patch.size
                         gt_pos_ratios[f"{task}_pos_ratio"] = round(pos_ratio, 6)
+                        task_positive[task] = pos_ratio > 0.0
                         if pos_ratio > 0.0:
                             is_positive = True
 
@@ -339,12 +368,23 @@ def prepare(
                         "mask": m_p,
                         "gt_patch_map": gt_patch_map,
                         "gt_pos_ratios": gt_pos_ratios,
+                        "task_positive": task_positive,
                         "is_positive": is_positive,
                     }
                 )
 
             positives = [p for p in patch_candidates if p["is_positive"]]
             negatives = [p for p in patch_candidates if not p["is_positive"]]
+
+            wrinkle_positives = [
+                p for p in patch_candidates
+                if p["gt_pos_ratios"].get("wrinkle_pos_ratio", 0.0) >= wrinkle_min_pos_ratio
+            ]
+            wrinkle_negatives = [
+                p for p in patch_candidates
+                if "wrinkle" in p["gt_patch_map"]
+                and p["gt_pos_ratios"].get("wrinkle_pos_ratio", 0.0) < wrinkle_min_pos_ratio
+            ]
 
             if positives:
                 neg_keep_count = min(
@@ -359,6 +399,31 @@ def prepare(
                 neg for i, neg in enumerate(negatives) if i in neg_keep_indices
             ]
 
+            if wrinkle_positives:
+                wrinkle_neg_keep_count = min(
+                    len(wrinkle_negatives),
+                    int(np.ceil(len(wrinkle_positives) * wrinkle_neg_pos_ratio)),
+                )
+            else:
+                wrinkle_neg_keep_count = min(
+                    len(wrinkle_negatives),
+                    max_wrinkle_negative_if_no_positive,
+                )
+
+            wrinkle_neg_keep_indices = select_negative_indices(
+                len(wrinkle_negatives),
+                wrinkle_neg_keep_count,
+            )
+            selected_ids = {id(p) for p in selected_patches}
+            for p in wrinkle_positives:
+                if id(p) not in selected_ids:
+                    selected_patches.append(p)
+                    selected_ids.add(id(p))
+            for i, p in enumerate(wrinkle_negatives):
+                if i in wrinkle_neg_keep_indices and id(p) not in selected_ids:
+                    selected_patches.append(p)
+                    selected_ids.add(id(p))
+
             saved = 0
             for idx, patch in enumerate(selected_patches):
                 y = patch["y"]
@@ -372,15 +437,20 @@ def prepare(
                 for task, gt_patch in patch["gt_patch_map"].items():
                     Image.fromarray(gt_patch, mode="L").save(out_root / task / f"{stem}.png")
 
+                wrinkle_pos_ratio = patch["gt_pos_ratios"].get("wrinkle_pos_ratio", 0.0)
+                has_wrinkle_patch = has_gt["wrinkle"] and wrinkle_pos_ratio >= wrinkle_min_pos_ratio
+
                 manifest[stem] = {
                     "subject_name": subject_name,
                     "patch_idx": idx,
                     "patch_pos": [y, x],
                     "has_brown": has_gt["brown"],
                     "has_red": has_gt["red"],
-                    "has_wrinkle": has_gt["wrinkle"],
+                    "has_wrinkle": has_wrinkle_patch,
                     "mask_applied": apply_mask,
                     "is_positive": patch["is_positive"],
+                    "is_wrinkle_positive": has_wrinkle_patch,
+                    "is_wrinkle_negative": has_gt["wrinkle"] and not has_wrinkle_patch,
                     **patch["gt_pos_ratios"],
                 }
                 saved += 1
@@ -388,7 +458,9 @@ def prepare(
 
             print(
                 f"    -> {saved}개 패치 저장 "
-                f"(positive={len(positives)}, negative_kept={neg_keep_count}/{len(negatives)})"
+                f"(positive={len(positives)}, negative_kept={neg_keep_count}/{len(negatives)}, "
+                f"wrinkle_pos={len(wrinkle_positives)}, "
+                f"wrinkle_neg_kept={wrinkle_neg_keep_count}/{len(wrinkle_negatives)})"
             )
     finally:
         if landmarker is not None:
@@ -439,6 +511,24 @@ if __name__ == "__main__":
         help="positive가 하나도 없을 때 유지할 negative patch 최대 개수 (기본 0)",
     )
     parser.add_argument(
+        "--wrinkle_min_pos_ratio",
+        type=float,
+        default=1e-5,
+        help="wrinkle positive patch로 인정할 최소 양성 픽셀 비율 (기본 1e-5)",
+    )
+    parser.add_argument(
+        "--wrinkle_neg_pos_ratio",
+        type=float,
+        default=2.0,
+        help="wrinkle positive 수 대비 유지할 wrinkle negative 최대 비율 (기본 2.0)",
+    )
+    parser.add_argument(
+        "--max_wrinkle_negative_if_no_positive",
+        type=int,
+        default=0,
+        help="wrinkle positive가 없을 때 유지할 wrinkle negative 최대 개수 (기본 0)",
+    )
+    parser.add_argument(
         "--disable_mediapipe",
         action="store_true",
         help="MediaPipe를 사용하지 않고 fallback 얼굴 마스크만 사용",
@@ -461,6 +551,9 @@ if __name__ == "__main__":
         apply_mask=not args.no_apply_mask,
         neg_pos_ratio=args.neg_pos_ratio,
         max_negative_if_no_positive=args.max_negative_if_no_positive,
+        wrinkle_min_pos_ratio=args.wrinkle_min_pos_ratio,
+        wrinkle_neg_pos_ratio=args.wrinkle_neg_pos_ratio,
+        max_wrinkle_negative_if_no_positive=args.max_wrinkle_negative_if_no_positive,
         disable_mediapipe=args.disable_mediapipe,
         face_landmarker_task_path=args.face_landmarker_task_path,
     )
