@@ -38,6 +38,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from PIL import Image
 from torch.utils.data import DataLoader, WeightedRandomSampler, random_split
@@ -92,6 +93,8 @@ CFG = dict(
     wrinkle_pos_boost=4.0,
     wrinkle_band_boost=2.0,
     wrinkle_band_sigma=6.0,
+    wrinkle_cldice_weight=0.15,
+    wrinkle_cldice_iters=10,
 
     wrinkle_min_pos_ratio=1e-5,
     wrinkle_compute_missing_pos_ratio=True,
@@ -375,6 +378,8 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         wrinkle_pos_boost: float = 4.0,
         wrinkle_band_boost: float = 2.0,
         wrinkle_band_sigma: float = 6.0,
+        wrinkle_cldice_weight: float = 0.15,
+        wrinkle_cldice_iters: int = 10,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -384,6 +389,8 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         self.wrinkle_pos_boost = wrinkle_pos_boost
         self.wrinkle_band_boost = wrinkle_band_boost
         self.wrinkle_band_sigma = wrinkle_band_sigma
+        self.wrinkle_cldice_weight = wrinkle_cldice_weight
+        self.wrinkle_cldice_iters = wrinkle_cldice_iters
 
     @staticmethod
     def _avail_tensor(has_gt, device):
@@ -517,6 +524,56 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         denom = (background * avail).sum().clamp(min=1.0)
         return per_pixel.sum() / denom
 
+    @staticmethod
+    def _soft_erode(x: torch.Tensor) -> torch.Tensor:
+        p1 = -F.max_pool2d(-x, kernel_size=(3, 1), stride=1, padding=(1, 0))
+        p2 = -F.max_pool2d(-x, kernel_size=(1, 3), stride=1, padding=(0, 1))
+        return torch.min(p1, p2)
+
+    @staticmethod
+    def _soft_dilate(x: torch.Tensor) -> torch.Tensor:
+        return F.max_pool2d(x, kernel_size=3, stride=1, padding=1)
+
+    def _soft_open(self, x: torch.Tensor) -> torch.Tensor:
+        return self._soft_dilate(self._soft_erode(x))
+
+    def _soft_skel(self, x: torch.Tensor, iterations: int) -> torch.Tensor:
+        x = x.clamp(0.0, 1.0)
+        x_open = self._soft_open(x)
+        skel = F.relu(x - x_open)
+
+        for _ in range(max(iterations, 1)):
+            x = self._soft_erode(x)
+            x_open = self._soft_open(x)
+            delta = F.relu(x - x_open)
+            skel = skel + F.relu(delta - skel * delta)
+
+        return skel.clamp(0.0, 1.0)
+
+    def _wrinkle_soft_cldice_loss(self, pred, gt, face_mask, has_gt):
+        avail = self._avail_tensor(has_gt, pred.device)
+        if avail.sum() <= 0:
+            return pred.new_tensor(0.0)
+
+        prob = (torch.sigmoid(pred) * face_mask).clamp(0.0, 1.0)
+        gt = (gt * face_mask).clamp(0.0, 1.0)
+        iters = max(int(self.wrinkle_cldice_iters), 1)
+
+        skel_prob = self._soft_skel(prob, iters)
+        skel_gt = self._soft_skel(gt, iters)
+
+        avail_4d = avail.view(-1, 1, 1, 1)
+        tprec_num = (skel_prob * gt * avail_4d).flatten(1).sum(1)
+        tprec_den = (skel_prob * avail_4d).flatten(1).sum(1)
+        tsens_num = (skel_gt * prob * avail_4d).flatten(1).sum(1)
+        tsens_den = (skel_gt * avail_4d).flatten(1).sum(1)
+
+        eps = 1e-6
+        tprec = (tprec_num + eps) / (tprec_den + eps)
+        tsens = (tsens_num + eps) / (tsens_den + eps)
+        cldice = 1.0 - (2.0 * tprec * tsens + eps) / (tprec + tsens + eps)
+        return (cldice * avail).sum() / avail.sum().clamp(min=1.0)
+
     def forward(
         self,
         result,
@@ -559,9 +616,13 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         l_wrinkle_distance = self._wrinkle_distance_penalty(
             result.wrinkle_mask, wrinkle_gt, face_mask, has_wrinkle
         )
+        l_wrinkle_cldice = self._wrinkle_soft_cldice_loss(
+            result.wrinkle_mask, wrinkle_gt, face_mask, has_wrinkle
+        )
         l_wrinkle = (
             l_wrinkle_base
             + self.wrinkle_distance_weight * l_wrinkle_distance
+            + self.wrinkle_cldice_weight * l_wrinkle_cldice
         )
 
         detail.update(
@@ -573,6 +634,7 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
             red_outside=l_red_outside.item(),
             wrinkle_base=l_wrinkle_base.item(),
             wrinkle_distance=l_wrinkle_distance.item(),
+            wrinkle_cldice=l_wrinkle_cldice.item(),
         )
 
         loss = torch.tensor(0.0, device=rgb_cross.device)
@@ -918,6 +980,8 @@ def main():
     print(f"  - task_probs: {CFG['task_probs']}")
     print(f"  - weighted_sampler: {CFG['use_weighted_sampler']}")
     print(f"  - wrinkle_min_pos_ratio: {CFG['wrinkle_min_pos_ratio']}")
+    print(f"  - wrinkle_cldice_weight: {CFG['wrinkle_cldice_weight']}")
+    print(f"  - wrinkle_cldice_iters: {CFG['wrinkle_cldice_iters']}")
 
     ckpt_dir = Path(CFG['checkpoint_dir'])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -997,6 +1061,8 @@ def main():
         wrinkle_pos_boost=CFG['wrinkle_pos_boost'],
         wrinkle_band_boost=CFG['wrinkle_band_boost'],
         wrinkle_band_sigma=CFG['wrinkle_band_sigma'],
+        wrinkle_cldice_weight=CFG['wrinkle_cldice_weight'],
+        wrinkle_cldice_iters=CFG['wrinkle_cldice_iters'],
     ).to(device)
 
     optimizer = optim.AdamW(
