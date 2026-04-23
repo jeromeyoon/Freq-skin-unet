@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
@@ -111,6 +113,53 @@ def create_face_landmarker(task_model_path: str | None):
     except Exception as e:
         print(f"    [WARN] FaceLandmarker 초기화 실패 ({e}) -> fallback 사용")
         return None, None
+
+
+_THREAD_LOCAL = threading.local()
+
+
+def get_thread_face_landmarker(disable_mediapipe: bool, task_model_path: str | None):
+    """
+    Return a thread-local MediaPipe FaceLandmarker.
+
+    FaceLandmarker instances are not shared across worker threads. This avoids
+    concurrent access to the same native object while still reusing one
+    landmarker per worker thread.
+    """
+    if disable_mediapipe:
+        return None, None
+
+    key = str(task_model_path or "")
+    cached_key = getattr(_THREAD_LOCAL, "face_landmarker_key", None)
+    cached_mp = getattr(_THREAD_LOCAL, "face_landmarker_mp", None)
+    cached_landmarker = getattr(_THREAD_LOCAL, "face_landmarker", None)
+
+    if cached_key == key and cached_mp is not None and cached_landmarker is not None:
+        return cached_mp, cached_landmarker
+
+    if cached_landmarker is not None:
+        try:
+            cached_landmarker.close()
+        except Exception:
+            pass
+
+    mp, landmarker = create_face_landmarker(task_model_path)
+    _THREAD_LOCAL.face_landmarker_key = key
+    _THREAD_LOCAL.face_landmarker_mp = mp
+    _THREAD_LOCAL.face_landmarker = landmarker
+    return mp, landmarker
+
+
+def close_thread_face_landmarker() -> None:
+    landmarker = getattr(_THREAD_LOCAL, "face_landmarker", None)
+    if landmarker is not None:
+        try:
+            landmarker.close()
+        except Exception:
+            pass
+    _THREAD_LOCAL.face_landmarker = None
+    _THREAD_LOCAL.face_landmarker_mp = None
+    _THREAD_LOCAL.face_landmarker_key = None
 
 
 def generate_face_mask_tasks(
@@ -298,6 +347,248 @@ def generate_task_centered_positions(
     return sorted(positions)
 
 
+def process_subject(
+    subject_index: int,
+    subj_dir: Path,
+    gt_maps: dict,
+    out_root: Path,
+    patch_size: int,
+    stride: int,
+    min_mask_coverage: float,
+    apply_mask: bool,
+    neg_pos_ratio: float,
+    max_negative_if_no_positive: int,
+    wrinkle_min_pos_ratio: float,
+    wrinkle_neg_pos_ratio: float,
+    max_wrinkle_negative_if_no_positive: int,
+    centered_tasks: tuple[str, ...],
+    centered_patches_per_task: int,
+    centered_jitter: int,
+    centered_min_mask_coverage: float,
+    centered_seed: int,
+    disable_mediapipe: bool,
+    face_landmarker_task_path: str | None,
+) -> dict:
+    """
+    Process one subject directory and save its patch files.
+
+    The returned manifest is subject-local and is merged by the main thread.
+    """
+    subject_name = subj_dir.name
+    logs: list[str] = []
+    subject_manifest: dict[str, dict] = {}
+
+    cross_path = subj_dir / "F_10.jpg"
+    parallel_path = subj_dir / "F_11.jpg"
+
+    if not cross_path.exists() or not parallel_path.exists():
+        logs.append(f"  [SKIP] {subject_name}: F_10.jpg / F_11.jpg ?놁쓬")
+        return {
+            "index": subject_index,
+            "subject_name": subject_name,
+            "skipped": True,
+            "saved": 0,
+            "manifest": subject_manifest,
+            "logs": logs,
+        }
+
+    gt_paths = {
+        task: find_matching_gt(subject_name, gt_maps[task])
+        for task in GT_SUBDIRS
+    }
+    has_gt = {task: p is not None for task, p in gt_paths.items()}
+    matched = [t for t, h in has_gt.items() if h]
+    if matched:
+        logs.append(f"  {subject_name}: GT={matched}")
+    else:
+        logs.append(f"  [INFO] {subject_name}: 留ㅼ묶??GT ?놁쓬 -> ?낅젰 only")
+
+    cross_bgr = load_rgb_bgr(cross_path)
+    h, w = cross_bgr.shape[:2]
+    parallel_bgr = load_rgb_bgr(parallel_path, target_hw=(h, w))
+
+    if disable_mediapipe:
+        face_mask = generate_face_mask_fallback_only(cross_bgr)
+    else:
+        mp, landmarker = get_thread_face_landmarker(
+            disable_mediapipe=disable_mediapipe,
+            task_model_path=face_landmarker_task_path,
+        )
+        face_mask = generate_face_mask_v2(cross_bgr, mp=mp, landmarker=landmarker)
+
+    gt_arrays = {}
+    for task, gt_p in gt_paths.items():
+        if gt_p is not None:
+            gt_arrays[task] = load_gray(gt_p, target_hw=(h, w))
+
+    rng = np.random.default_rng(centered_seed + subject_index)
+    valid_positions = find_valid_positions(
+        face_mask, patch_size, stride, min_mask_coverage
+    )
+    position_set = set(valid_positions)
+    centered_counts: dict[str, int] = {}
+    for task in centered_tasks:
+        if task not in gt_arrays:
+            centered_counts[task] = 0
+            continue
+        extra_positions = generate_task_centered_positions(
+            gt_array=gt_arrays[task],
+            face_mask=face_mask,
+            patch_size=patch_size,
+            max_patches=centered_patches_per_task,
+            jitter=centered_jitter,
+            min_mask_coverage=centered_min_mask_coverage,
+            rng=rng,
+        )
+        added = 0
+        for pos in extra_positions:
+            if pos not in position_set:
+                valid_positions.append(pos)
+                position_set.add(pos)
+                added += 1
+        centered_counts[task] = added
+
+    patch_candidates = []
+    for y, x in valid_positions:
+        c_p = crop_patch(cross_bgr, y, x, patch_size)
+        p_p = crop_patch(parallel_bgr, y, x, patch_size)
+        m_p = crop_patch(face_mask, y, x, patch_size)
+
+        if apply_mask:
+            c_p = apply_mask_to_rgb(c_p, m_p)
+            p_p = apply_mask_to_rgb(p_p, m_p)
+
+        gt_pos_ratios = {}
+        task_positive = {}
+        is_positive = False
+        gt_patch_map = {}
+        for task in ["brown", "red", "wrinkle"]:
+            if task in gt_arrays:
+                gt_patch = crop_patch(gt_arrays[task], y, x, patch_size)
+                if apply_mask:
+                    gt_patch = apply_mask_to_gray(gt_patch, m_p)
+                gt_patch_map[task] = gt_patch
+
+                pos_ratio = float((gt_patch > 127).sum()) / gt_patch.size
+                gt_pos_ratios[f"{task}_pos_ratio"] = round(pos_ratio, 6)
+                task_positive[task] = pos_ratio > 0.0
+                if pos_ratio > 0.0:
+                    is_positive = True
+
+        patch_candidates.append(
+            {
+                "y": y,
+                "x": x,
+                "cross": c_p,
+                "parallel": p_p,
+                "mask": m_p,
+                "gt_patch_map": gt_patch_map,
+                "gt_pos_ratios": gt_pos_ratios,
+                "task_positive": task_positive,
+                "is_positive": is_positive,
+            }
+        )
+
+    positives = [p for p in patch_candidates if p["is_positive"]]
+    negatives = [p for p in patch_candidates if not p["is_positive"]]
+
+    wrinkle_positives = [
+        p for p in patch_candidates
+        if p["gt_pos_ratios"].get("wrinkle_pos_ratio", 0.0) >= wrinkle_min_pos_ratio
+    ]
+    wrinkle_negatives = [
+        p for p in patch_candidates
+        if "wrinkle" in p["gt_patch_map"]
+        and p["gt_pos_ratios"].get("wrinkle_pos_ratio", 0.0) < wrinkle_min_pos_ratio
+    ]
+
+    if positives:
+        neg_keep_count = min(
+            len(negatives),
+            int(np.ceil(len(positives) * neg_pos_ratio)),
+        )
+    else:
+        neg_keep_count = min(len(negatives), max_negative_if_no_positive)
+
+    neg_keep_indices = select_negative_indices(len(negatives), neg_keep_count)
+    selected_patches = positives + [
+        neg for i, neg in enumerate(negatives) if i in neg_keep_indices
+    ]
+
+    if wrinkle_positives:
+        wrinkle_neg_keep_count = min(
+            len(wrinkle_negatives),
+            int(np.ceil(len(wrinkle_positives) * wrinkle_neg_pos_ratio)),
+        )
+    else:
+        wrinkle_neg_keep_count = min(
+            len(wrinkle_negatives),
+            max_wrinkle_negative_if_no_positive,
+        )
+
+    wrinkle_neg_keep_indices = select_negative_indices(
+        len(wrinkle_negatives),
+        wrinkle_neg_keep_count,
+    )
+    selected_ids = {id(p) for p in selected_patches}
+    for p in wrinkle_positives:
+        if id(p) not in selected_ids:
+            selected_patches.append(p)
+            selected_ids.add(id(p))
+    for i, p in enumerate(wrinkle_negatives):
+        if i in wrinkle_neg_keep_indices and id(p) not in selected_ids:
+            selected_patches.append(p)
+            selected_ids.add(id(p))
+
+    saved = 0
+    for idx, patch in enumerate(selected_patches):
+        y = patch["y"]
+        x = patch["x"]
+        stem = f"{subject_name}_{idx:04d}"
+
+        bgr2rgb_pil(patch["cross"]).save(out_root / "rgb_cross" / f"{stem}.png")
+        bgr2rgb_pil(patch["parallel"]).save(out_root / "rgb_parallel" / f"{stem}.png")
+        Image.fromarray(patch["mask"], mode="L").save(out_root / "mask" / f"{stem}.png")
+
+        for task, gt_patch in patch["gt_patch_map"].items():
+            Image.fromarray(gt_patch, mode="L").save(out_root / task / f"{stem}.png")
+
+        wrinkle_pos_ratio = patch["gt_pos_ratios"].get("wrinkle_pos_ratio", 0.0)
+        has_wrinkle_patch = has_gt["wrinkle"] and wrinkle_pos_ratio >= wrinkle_min_pos_ratio
+
+        subject_manifest[stem] = {
+            "subject_name": subject_name,
+            "patch_idx": idx,
+            "patch_pos": [y, x],
+            "has_brown": has_gt["brown"],
+            "has_red": has_gt["red"],
+            "has_wrinkle": has_wrinkle_patch,
+            "mask_applied": apply_mask,
+            "is_positive": patch["is_positive"],
+            "is_wrinkle_positive": has_wrinkle_patch,
+            "is_wrinkle_negative": has_gt["wrinkle"] and not has_wrinkle_patch,
+            **patch["gt_pos_ratios"],
+        }
+        saved += 1
+
+    logs.append(
+        f"    -> {saved}媛??⑥튂 ???"
+        f"(positive={len(positives)}, negative_kept={neg_keep_count}/{len(negatives)}, "
+        f"centered={centered_counts}, "
+        f"wrinkle_pos={len(wrinkle_positives)}, "
+        f"wrinkle_neg_kept={wrinkle_neg_keep_count}/{len(wrinkle_negatives)})"
+    )
+
+    return {
+        "index": subject_index,
+        "subject_name": subject_name,
+        "skipped": False,
+        "saved": saved,
+        "manifest": subject_manifest,
+        "logs": logs,
+    }
+
+
 def prepare(
     input_path: str,
     gt_path: str,
@@ -318,6 +609,7 @@ def prepare(
     centered_seed: int = 42,
     disable_mediapipe: bool = False,
     face_landmarker_task_path: str | None = None,
+    num_workers: int = 1,
 ) -> None:
     input_root = Path(input_path)
     gt_root = Path(gt_path)
@@ -339,6 +631,88 @@ def prepare(
     manifest: dict[str, dict] = {}
     total_patches = 0
     skipped_ids: list[str] = []
+
+    num_workers = max(1, int(num_workers))
+    print(f"workers: {num_workers}")
+
+    worker_kwargs = dict(
+        gt_maps=gt_maps,
+        out_root=out_root,
+        patch_size=patch_size,
+        stride=stride,
+        min_mask_coverage=min_mask_coverage,
+        apply_mask=apply_mask,
+        neg_pos_ratio=neg_pos_ratio,
+        max_negative_if_no_positive=max_negative_if_no_positive,
+        wrinkle_min_pos_ratio=wrinkle_min_pos_ratio,
+        wrinkle_neg_pos_ratio=wrinkle_neg_pos_ratio,
+        max_wrinkle_negative_if_no_positive=max_wrinkle_negative_if_no_positive,
+        centered_tasks=centered_tasks,
+        centered_patches_per_task=centered_patches_per_task,
+        centered_jitter=centered_jitter,
+        centered_min_mask_coverage=centered_min_mask_coverage,
+        centered_seed=centered_seed,
+        disable_mediapipe=disable_mediapipe,
+        face_landmarker_task_path=face_landmarker_task_path,
+    )
+
+    results: list[dict | None] = [None] * len(subject_dirs)
+    try:
+        if num_workers == 1:
+            for i, subj_dir in enumerate(subject_dirs):
+                results[i] = process_subject(i, subj_dir, **worker_kwargs)
+                for line in results[i]["logs"]:
+                    print(line)
+        else:
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = {
+                    executor.submit(process_subject, i, subj_dir, **worker_kwargs): i
+                    for i, subj_dir in enumerate(subject_dirs)
+                }
+                done = 0
+                for future in as_completed(futures):
+                    i = futures[future]
+                    results[i] = future.result()
+                    done += 1
+                    result = results[i]
+                    print(
+                        f"  [DONE {done}/{len(subject_dirs)}] "
+                        f"{result['subject_name']}: saved={result['saved']}"
+                    )
+    finally:
+        # Closes the main-thread landmarker when num_workers=1. Worker-thread
+        # landmarker instances are released when the process exits.
+        close_thread_face_landmarker()
+
+    for result in results:
+        if result is None:
+            continue
+        if num_workers > 1:
+            for line in result["logs"]:
+                print(line)
+        if result["skipped"]:
+            skipped_ids.append(result["subject_name"])
+            continue
+        manifest.update(result["manifest"])
+        total_patches += int(result["saved"])
+
+    manifest_path = out_root / "manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+    print(f"\n?꾨즺: 珥?{total_patches}媛??⑥튂 ?앹꽦 -> {patch_dir}")
+    if skipped_ids:
+        print(f"?먮낯 ?대?吏媛 ?놁뼱 嫄대꼫??ID: {skipped_ids}")
+
+    stats = {
+        t: sum(1 for v in manifest.values() if v[f"has_{t}"])
+        for t in ["brown", "red", "wrinkle"]
+    }
+    print(f"  brown GT:   {stats['brown']:,} ?⑥튂")
+    print(f"  red GT:     {stats['red']:,} ?⑥튂")
+    print(f"  wrinkle GT: {stats['wrinkle']:,} ?⑥튂")
+    return
+
     rng = np.random.default_rng(centered_seed)
 
     mp = None
@@ -646,6 +1020,12 @@ if __name__ == "__main__":
         default=None,
         help="최신 MediaPipe Tasks API용 face_landmarker.task 모델 경로",
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=1,
+        help="ID 단위 병렬 처리 worker 수 (기본 1, 예: 4)",
+    )
     args = parser.parse_args()
 
     prepare(
@@ -670,4 +1050,5 @@ if __name__ == "__main__":
         centered_seed=args.centered_seed,
         disable_mediapipe=args.disable_mediapipe,
         face_landmarker_task_path=args.face_landmarker_task_path,
+        num_workers=args.num_workers,
     )
