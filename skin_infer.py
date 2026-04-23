@@ -296,6 +296,22 @@ def infer_patch_based(
     red_final     = (red_acc     / weight_acc).clamp(0, 1)
     wrinkle_final = (wrinkle_acc / weight_acc).clamp(0, 1)
 
+    # 최종 결과도 skin mask 영역으로 제한한다.
+    # 모델 입력과 score에는 mask가 쓰이지만, head의 raw probability는 mask 밖에서도
+    # 값이 남을 수 있으므로 저장/시각화 전 확률맵 자체를 ROI로 잘라낸다.
+    if skin_mask.shape != brown_final.shape:
+        roi = F.interpolate(
+            skin_mask.unsqueeze(0),
+            size=brown_final.shape[1:],
+            mode='nearest',
+        ).squeeze(0)
+    else:
+        roi = skin_mask
+    roi = roi.round().clamp(0, 1)
+    brown_final = brown_final * roi
+    red_final = red_final * roi
+    wrinkle_final = wrinkle_final * roi
+
     # 스코어: 피부 영역 내 평균 확률 × 100
     def _score(prob_map: torch.Tensor) -> float:
         denom = skin_mask.sum().clamp(min=1.0)
@@ -390,10 +406,20 @@ def infer_single(
 
         result = model(rgb_cross, rgb_parallel, mask)
 
+        brown_prob = torch.sigmoid(result.brown_mask[0]).cpu()
+        red_prob = torch.sigmoid(result.red_mask[0]).cpu()
+        wrinkle_prob = torch.sigmoid(result.wrinkle_mask[0]).cpu()
+
+        if mask is not None:
+            roi = mask[0].detach().cpu().round().clamp(0, 1)
+            brown_prob = brown_prob * roi
+            red_prob = red_prob * roi
+            wrinkle_prob = wrinkle_prob * roi
+
         return {
-            'brown_mask'    : torch.sigmoid(result.brown_mask[0]).cpu(),
-            'red_mask'      : torch.sigmoid(result.red_mask[0]).cpu(),
-            'wrinkle_mask'  : torch.sigmoid(result.wrinkle_mask[0]).cpu(),
+            'brown_mask'    : brown_prob,
+            'red_mask'      : red_prob,
+            'wrinkle_mask'  : wrinkle_prob,
             'brown_score'   : result.brown_score[0].item(),
             'red_score'     : result.red_score[0].item(),
             'wrinkle_score' : result.wrinkle_score[0].item(),

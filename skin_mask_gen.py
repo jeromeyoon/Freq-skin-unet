@@ -128,15 +128,46 @@ def _fill_landmark_regions(
 
     if remove_neck:
         jaw_pts = lm_pts(_JAWLINE)
-        jaw_cut = np.vstack([
-            jaw_pts,
-            np.array([[w - 1, h - 1], [0, h - 1]], dtype=np.int32),
-        ])
         neck_region = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(neck_region, [jaw_cut], 255)
-        jaw_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        neck_region = cv2.dilate(neck_region, jaw_dilate, iterations=1)
-        mask = cv2.bitwise_and(mask, cv2.bitwise_not(neck_region))
+        valid = (
+            (jaw_pts[:, 0] >= 0)
+            & (jaw_pts[:, 0] < w)
+            & (jaw_pts[:, 1] >= 0)
+            & (jaw_pts[:, 1] < h)
+        )
+        jaw_pts = jaw_pts[valid]
+
+        if len(jaw_pts) >= 2:
+            # The original new_data_prep-style polygon can become a diagonal cut
+            # across the face when landmark order/self-intersection is unstable.
+            # Use an x-sorted jaw curve instead, and never cut above the lower
+            # face.  This keeps forehead/cheeks/lips while still suppressing neck.
+            order = np.argsort(jaw_pts[:, 0])
+            jaw_pts = jaw_pts[order]
+            xs = jaw_pts[:, 0]
+            ys = jaw_pts[:, 1]
+
+            uniq_xs, uniq_idx = np.unique(xs, return_index=True)
+            uniq_ys = ys[uniq_idx]
+
+            if len(uniq_xs) >= 2:
+                x_min = int(uniq_xs.min())
+                x_max = int(uniq_xs.max())
+                x_grid = np.arange(x_min, x_max + 1)
+                y_curve = np.interp(x_grid, uniq_xs, uniq_ys)
+
+                # Do not remove pixels above the lower-face band even if a
+                # jaw landmark is accidentally high near the ear/mouth.
+                lower_face_floor = int(h * 0.68)
+                y_curve = np.maximum(y_curve + 8.0, lower_face_floor)
+                y_curve = np.clip(y_curve, 0, h - 1).astype(np.int32)
+
+                for x_col, y0 in zip(x_grid, y_curve):
+                    neck_region[y0:, x_col] = 255
+
+                jaw_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+                neck_region = cv2.dilate(neck_region, jaw_dilate, iterations=1)
+                mask = cv2.bitwise_and(mask, cv2.bitwise_not(neck_region))
 
     return mask
 
@@ -197,7 +228,10 @@ def _mask_from_face_landmarker_tasks(img_bgr: np.ndarray, mp, landmarker) -> np.
         w=w,
         lm_pts=lm_pts,
         exclude_regions=_EXCLUDE_REGIONS_NEW_PREP,
-        remove_neck=True,
+        # Face oval already follows the chin contour.  A separate jawline/neck
+        # cut can self-intersect on some faces and remove a large diagonal part
+        # of the lower face, so inference keeps the full face-oval ROI.
+        remove_neck=False,
     )
 
 
