@@ -120,6 +120,12 @@ def parse_args() -> argparse.Namespace:
         default=12,
         help="max patches kept per subject before final global prune",
     )
+    parser.add_argument(
+        "--patch_dedup_iou",
+        type=float,
+        default=0.80,
+        help="IoU threshold for removing near-duplicate overlapping patches",
+    )
     return parser.parse_args()
 
 
@@ -150,6 +156,7 @@ def main() -> None:
         num_workers=args.num_workers,
         max_total_patches=args.max_total_patches,
         max_patches_per_subject=args.max_patches_per_subject,
+        patch_dedup_iou=args.patch_dedup_iou,
     )
 
 

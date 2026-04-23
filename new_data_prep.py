@@ -399,6 +399,7 @@ def process_subject(
     disable_mediapipe: bool,
     face_landmarker_task_path: str | None,
     max_patches_per_subject: int | None = None,
+    patch_dedup_iou: float = 0.80,
 ) -> dict:
     """
     Process one subject directory and save its patch files.
@@ -575,6 +576,12 @@ def process_subject(
             selected_patches.append(p)
             selected_ids.add(id(p))
 
+    selected_patches, dedup_dropped = dedup_selected_patches(
+        selected_patches=selected_patches,
+        patch_size=patch_size,
+        dedup_iou_threshold=patch_dedup_iou,
+    )
+
     pre_save_dropped = 0
     if max_patches_per_subject and max_patches_per_subject > 0:
         if len(selected_patches) > max_patches_per_subject:
@@ -622,6 +629,7 @@ def process_subject(
         f"(positive={len(positives)}, negative_kept={neg_keep_count}/{len(negatives)}, "
         f"centered={centered_counts}, "
         f"wrinkle_pos={len(wrinkle_positives)}, "
+        f"dedup_dropped={dedup_dropped}, "
         f"wrinkle_neg_kept={wrinkle_neg_keep_count}/{len(wrinkle_negatives)}, "
         f"pre_save_dropped={pre_save_dropped})"
     )
@@ -692,6 +700,58 @@ def _patch_candidate_quality_score(patch: dict) -> tuple:
         min(brown_ratio, 1.0),
         is_positive,
     )
+
+
+def _same_size_patch_iou(a: dict, b: dict, patch_size: int) -> float:
+    ay1, ax1 = int(a["y"]), int(a["x"])
+    by1, bx1 = int(b["y"]), int(b["x"])
+    ay2, ax2 = ay1 + patch_size, ax1 + patch_size
+    by2, bx2 = by1 + patch_size, bx1 + patch_size
+
+    inter_h = max(0, min(ay2, by2) - max(ay1, by1))
+    inter_w = max(0, min(ax2, bx2) - max(ax1, bx1))
+    inter = inter_h * inter_w
+    if inter <= 0:
+        return 0.0
+
+    area = patch_size * patch_size
+    union = area + area - inter
+    return float(inter) / max(float(union), 1.0)
+
+
+def dedup_selected_patches(
+    selected_patches: list[dict],
+    patch_size: int,
+    dedup_iou_threshold: float,
+) -> tuple[list[dict], int]:
+    """
+    Remove near-duplicate patches that overlap too much.
+
+    Patches are processed in descending quality order, so when two patches are
+    almost the same, the better one is kept.
+    """
+    if dedup_iou_threshold <= 0.0 or len(selected_patches) <= 1:
+        return selected_patches, 0
+
+    ranked = sorted(
+        selected_patches,
+        key=_patch_candidate_quality_score,
+        reverse=True,
+    )
+
+    kept: list[dict] = []
+    dropped = 0
+    for patch in ranked:
+        is_duplicate = False
+        for kept_patch in kept:
+            if _same_size_patch_iou(patch, kept_patch, patch_size) >= dedup_iou_threshold:
+                is_duplicate = True
+                dropped += 1
+                break
+        if not is_duplicate:
+            kept.append(patch)
+
+    return kept, dropped
 
 
 def prune_saved_patches(
@@ -781,6 +841,7 @@ def prepare(
     num_workers: int = 1,
     max_total_patches: int = 2000,
     max_patches_per_subject: int = 12,
+    patch_dedup_iou: float = 0.80,
 ) -> None:
     input_root = Path(input_path)
     gt_root = Path(gt_path)
@@ -827,6 +888,7 @@ def prepare(
         disable_mediapipe=disable_mediapipe,
         face_landmarker_task_path=face_landmarker_task_path,
         max_patches_per_subject=max_patches_per_subject,
+        patch_dedup_iou=patch_dedup_iou,
     )
 
     results: list[dict | None] = [None] * len(subject_dirs)
@@ -1219,6 +1281,12 @@ if __name__ == "__main__":
         default=12,
         help="한 subject에서 유지할 patch 최대 수 (기본 12, 0 이하면 제한 없음)",
     )
+    parser.add_argument(
+        "--patch_dedup_iou",
+        type=float,
+        default=0.80,
+        help="겹침이 큰 near-duplicate patch 제거 IoU 임계값 (기본 0.80, 0 이하면 비활성화)",
+    )
     args = parser.parse_args()
 
     prepare(
@@ -1246,4 +1314,5 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         max_total_patches=args.max_total_patches,
         max_patches_per_subject=args.max_patches_per_subject,
+        patch_dedup_iou=args.patch_dedup_iou,
     )
