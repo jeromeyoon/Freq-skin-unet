@@ -70,6 +70,7 @@ class WrinklePositiveSkinDataset(base.SkinDataset):
         self.wrinkle_min_pos_ratio = float(wrinkle_min_pos_ratio)
         self.compute_missing_pos_ratio = bool(compute_missing_pos_ratio)
         self._apply_wrinkle_patch_gate()
+        self._drop_empty_after_wrinkle_gate()
 
     def _read_wrinkle_pos_ratio(self, stem: str) -> float:
         gt_path = self.patch_dir / 'wrinkle' / f'{stem}.png'
@@ -113,6 +114,34 @@ class WrinklePositiveSkinDataset(base.SkinDataset):
             f"threshold={self.wrinkle_min_pos_ratio:g}, "
             f"has_before={before_has}, has_after={after_has}, "
             f"disabled_black={disabled_black}, missing_ratio={missing_ratio}"
+        )
+
+    def _drop_empty_after_wrinkle_gate(self) -> None:
+        """
+        Drop samples that become fully unsupervised after disabling black wrinkle.
+
+        The base SkinDataset filters samples with no GT before this wrapper changes
+        has_wrinkle.  If a sample had only a black wrinkle GT, the wrapper can turn
+        all task flags off.  Such samples would produce a zero supervised loss and
+        can make backward unsafe, so remove them from this training dataset.
+        """
+        before = len(self.stems)
+        still_valid = []
+        newly_empty = []
+        for stem in self.stems:
+            info = self.manifest[stem]
+            if any(info.get(f'has_{task}', False) for task in ('brown', 'red', 'wrinkle')):
+                still_valid.append(stem)
+            else:
+                newly_empty.append(stem)
+
+        if newly_empty:
+            self.stems = still_valid
+            self.excluded_stems.extend(newly_empty)
+
+        print(
+            "[WrinklePositiveSkinDataset] empty-after-gate filter: "
+            f"kept={len(self.stems)}/{before}, newly_excluded={len(newly_empty)}"
         )
 
 
