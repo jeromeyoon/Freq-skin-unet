@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, WeightedRandomSampler, random_split
 from tqdm import tqdm
 
 import skin_train_v2 as base
@@ -43,6 +43,8 @@ CFG = copy.deepcopy(v8.CFG)
 CFG.update(
     checkpoint_dir='./checkpoints_v9',
     preview_dir='./previews_v9',
+    use_weighted_sampler=True,
+    sampler_neg_weight=0.02,
     task_sampling_enabled=True,
     # Sparse tasks get higher probability.  Selection is restricted to tasks
     # that are actually available in the current batch.
@@ -428,11 +430,30 @@ def main():
     val_ds.dataset.augment = False
 
     prefetch_factor = CFG['prefetch_factor'] if CFG['num_workers'] > 0 else None
+    train_sampler = None
+    if CFG.get('use_weighted_sampler', False):
+        all_weights = full_ds.get_sample_weights(
+            neg_weight=CFG.get('sampler_neg_weight', 0.02)
+        )
+        train_weights = [all_weights[i] for i in train_ds.indices]
+        train_sampler = WeightedRandomSampler(
+            weights=train_weights,
+            num_samples=len(train_weights),
+            replacement=True,
+        )
+        print(
+            "Weighted sampler: ON "
+            f"(train_samples={len(train_weights)}, "
+            f"neg_weight={CFG.get('sampler_neg_weight', 0.02)})"
+        )
+    else:
+        print("Weighted sampler: OFF")
 
     train_loader = DataLoader(
         train_ds,
         CFG['batch_size'],
-        shuffle=not CFG.get('use_weighted_sampler', False),
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=CFG['num_workers'],
         pin_memory=True,
         persistent_workers=CFG['num_workers'] > 0,
