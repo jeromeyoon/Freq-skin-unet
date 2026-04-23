@@ -100,6 +100,8 @@ def parse_args() -> argparse.Namespace:
                         help='save binary prediction masks')
     parser.add_argument('--no_mediapipe', action='store_true',
                         help='disable MediaPipe skin-mask generation fallback')
+    parser.add_argument('--face_landmarker_task_path', default=None,
+                        help='MediaPipe face_landmarker.task path; when set, use new_data_prep-compatible mask generation')
     return parser.parse_args()
 
 
@@ -225,6 +227,7 @@ def main() -> None:
         skin_mask = generate_skin_mask(
             rgb_full,
             use_mediapipe=not args.no_mediapipe,
+            face_landmarker_task_path=args.face_landmarker_task_path,
         )
 
         pred = infer_single(
