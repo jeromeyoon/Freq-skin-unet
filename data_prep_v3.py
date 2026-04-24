@@ -160,13 +160,12 @@ def _collect_patch_candidates(
         is_positive = False
         for task, gt_arr in gt_arrays.items():
             gt_patch = crop_patch(gt_arr, y, x, patch_size)
-            gt_patch_for_ratio = (
-                apply_mask_to_gray(gt_patch, m_p) if apply_mask else gt_patch
-            )
-            gt_patch_save = apply_mask_to_gray(gt_patch, m_p) if apply_mask else gt_patch
-            gt_patch_map[task] = gt_patch_save
+            # GT는 apply_mask 여부와 무관하게 항상 face mask를 적용한다.
+            # 피부 영역 밖의 GT 픽셀이 학습 신호에 포함되면 noise가 되기 때문.
+            gt_patch_masked = apply_mask_to_gray(gt_patch, m_p)
+            gt_patch_map[task] = gt_patch_masked
 
-            pos_ratio = float((gt_patch_for_ratio > 127).sum()) / max(float(gt_patch_for_ratio.size), 1.0)
+            pos_ratio = float((gt_patch_masked > 127).sum()) / max(float(gt_patch_masked.size), 1.0)
             gt_pos_ratios[f"{task}_pos_ratio"] = round(pos_ratio, 6)
             if pos_ratio > 0.0:
                 is_positive = True
