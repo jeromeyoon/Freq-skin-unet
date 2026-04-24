@@ -1004,6 +1004,12 @@ def main():
     parser = argparse.ArgumentParser(
         description='SkinAnalyzerV2 training V9 standalone (task-sampled multi-task)'
     )
+    parser.add_argument(
+        '--patch_dir',
+        type=str,
+        default=CFG['patch_dir'],
+        help='patch dataset directory (e.g. patches_v3)',
+    )
     parser.add_argument('--resume', type=str, default=None, help='checkpoint path to resume')
     parser.add_argument(
         '--wrinkle_min_pos_ratio',
@@ -1023,6 +1029,7 @@ def main():
         help='disable task sampling and train all tasks jointly',
     )
     args = parser.parse_args()
+    CFG['patch_dir'] = args.patch_dir
     CFG['wrinkle_min_pos_ratio'] = args.wrinkle_min_pos_ratio
     CFG['task_probs'] = _parse_task_probs(args.task_probs)
     CFG['task_sampling_enabled'] = not args.disable_task_sampling
@@ -1042,6 +1049,7 @@ def main():
     print(f"  - task_sampling_enabled: {CFG['task_sampling_enabled']}")
     print(f"  - task_probs: {CFG['task_probs']}")
     print(f"  - weighted_sampler: {CFG['use_weighted_sampler']}")
+    print(f"  - patch_dir: {CFG['patch_dir']}")
     print(f"  - wrinkle_min_pos_ratio: {CFG['wrinkle_min_pos_ratio']}")
     print(f"  - wrinkle_tversky: alpha={CFG['wrinkle_tversky_alpha']}, beta={CFG['wrinkle_tversky_beta']}")
     print(f"  - wrinkle_focal: gamma={CFG['wrinkle_focal_gamma']}, alpha={CFG['wrinkle_focal_alpha']}")
