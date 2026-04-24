@@ -396,6 +396,8 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
     def __init__(
         self,
         *args,
+        red_focal_alpha: float = 0.75,
+        red_gt_dilation: int = 0,
         red_area_weight: float = 0.20,
         red_outside_weight: float = 0.12,
         wrinkle_tversky_alpha: float = 0.3,
@@ -407,6 +409,8 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.red_focal_alpha = red_focal_alpha
+        self.red_gt_dilation = red_gt_dilation
         self.red_area_weight = red_area_weight
         self.red_outside_weight = red_outside_weight
         self.wrinkle_tversky_alpha = wrinkle_tversky_alpha
@@ -500,6 +504,21 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         k = 2 * self.wrinkle_gt_dilation + 1
         return F.max_pool2d(
             gt, kernel_size=k, stride=1, padding=self.wrinkle_gt_dilation
+        ).clamp(0.0, 1.0)
+
+    def _dilate_red_gt(self, gt: torch.Tensor) -> torch.Tensor:
+        """Optional soft-label dilation for red spot GT.
+
+        Red GT boundaries annotated by specialists may be 1-2 pixels tight.
+        A 1-pixel dilation reduces loss spikes from boundary mis-registration
+        without expanding the supervision area as aggressively as wrinkle's 2 px.
+        red_gt_dilation=0 (default) leaves GT unchanged for V9 compatibility.
+        """
+        if self.red_gt_dilation <= 0:
+            return gt
+        k = 2 * self.red_gt_dilation + 1
+        return F.max_pool2d(
+            gt, kernel_size=k, stride=1, padding=self.red_gt_dilation
         ).clamp(0.0, 1.0)
 
     def _tversky_loss(self, pred, gt, face_mask, has_gt) -> torch.Tensor:
@@ -625,21 +644,23 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
             result.brown_mask, brown_gt, face_mask, has_brown, alpha=0.5
         )
 
-        # Red loss: Focal(alpha=0.75) + GDice blended 50/50.
-        # GDice alone lacks easy-negative suppression for sparse red lesions.
-        # alpha=0.75 sits between brown(0.5, less sparse) and wrinkle(0.97, most sparse).
+        # Red loss: Focal(alpha=self.red_focal_alpha) + GDice blended 50/50.
+        # Optional 1-px GT dilation (red_gt_dilation) reduces loss spikes from
+        # boundary mis-registration in specialist annotations.
+        red_gt_eff = self._dilate_red_gt(red_gt)
         l_red_focal = self._focal_dice_spot(
-            result.red_mask, red_gt, face_mask, has_red, alpha=0.75
+            result.red_mask, red_gt_eff, face_mask, has_red,
+            alpha=self.red_focal_alpha,
         )
         l_red_gdice = self._generalized_dice_loss(
-            result.red_mask, red_gt, face_mask, has_red
+            result.red_mask, red_gt_eff, face_mask, has_red
         )
         l_red_base = 0.5 * l_red_focal + 0.5 * l_red_gdice
         l_red_area = self._area_ratio_penalty(
-            result.red_mask, red_gt, face_mask, has_red
+            result.red_mask, red_gt_eff, face_mask, has_red
         )
         l_red_outside = self._outside_gt_penalty(
-            result.red_mask, red_gt, face_mask, has_red
+            result.red_mask, red_gt_eff, face_mask, has_red
         )
         l_red = (
             l_red_base
@@ -1099,6 +1120,8 @@ def main():
         w_red=CFG['w_red'],
         w_wrinkle=CFG['w_wrinkle'],
         w_recon=CFG['w_recon'],
+        red_focal_alpha=CFG.get('red_focal_alpha', 0.75),
+        red_gt_dilation=CFG.get('red_gt_dilation', 0),
         red_area_weight=CFG['red_area_weight'],
         red_outside_weight=CFG['red_outside_weight'],
         wrinkle_tversky_alpha=CFG['wrinkle_tversky_alpha'],
