@@ -204,6 +204,23 @@ def _select_candidates(
     return positives + [neg for i, neg in enumerate(negatives) if i in neg_keep_indices]
 
 
+def _same_size_patch_iou(a: dict, b: dict, patch_size: int) -> float:
+    ay1, ax1 = int(a["y"]), int(a["x"])
+    by1, bx1 = int(b["y"]), int(b["x"])
+    ay2, ax2 = ay1 + patch_size, ax1 + patch_size
+    by2, bx2 = by1 + patch_size, bx1 + patch_size
+
+    inter_h = max(0, min(ay2, by2) - max(ay1, by1))
+    inter_w = max(0, min(ax2, bx2) - max(ax1, bx1))
+    inter = inter_h * inter_w
+    if inter <= 0:
+        return 0.0
+
+    area = patch_size * patch_size
+    union = area + area - inter
+    return float(inter) / max(float(union), 1.0)
+
+
 def _annotate_stream_candidates(
     selected_patches: list[dict],
     *,
@@ -221,6 +238,52 @@ def _annotate_stream_candidates(
         item["_has_wrinkle"] = has_wrinkle
         out.append(item)
     return out
+
+
+def _stream_patch_quality(patch: dict) -> tuple:
+    wrinkle_ratio = float(patch["gt_pos_ratios"].get("wrinkle_pos_ratio", 0.0))
+    red_ratio = float(patch["gt_pos_ratios"].get("red_pos_ratio", 0.0))
+    brown_ratio = float(patch["gt_pos_ratios"].get("brown_pos_ratio", 0.0))
+
+    wrinkle_pos = int(wrinkle_ratio > 0.0)
+    red_pos = int(red_ratio > 0.0)
+    brown_pos = int(brown_ratio > 0.0)
+    positive_task_count = wrinkle_pos + red_pos + brown_pos
+    is_positive = int(patch.get("is_positive", False))
+
+    return (
+        wrinkle_pos,
+        positive_task_count,
+        red_pos,
+        brown_pos,
+        min(wrinkle_ratio, 1.0),
+        min(red_ratio, 1.0),
+        min(brown_ratio, 1.0),
+        is_positive,
+    )
+
+
+def dedup_selected_patches(
+    selected_patches: list[dict],
+    patch_size: int,
+    dedup_iou_threshold: float,
+) -> tuple[list[dict], int]:
+    if dedup_iou_threshold <= 0.0 or len(selected_patches) <= 1:
+        return selected_patches, 0
+
+    ranked = sorted(
+        selected_patches,
+        key=_stream_patch_quality,
+        reverse=True,
+    )
+    kept: list[dict] = []
+    dropped = 0
+    for cand in ranked:
+        if any(_same_size_patch_iou(cand, prev, patch_size) >= dedup_iou_threshold for prev in kept):
+            dropped += 1
+            continue
+        kept.append(cand)
+    return kept, dropped
 
 
 def _combined_patch_quality(patch: dict) -> tuple:
@@ -309,12 +372,13 @@ def prepare_v3(
     wrinkle_min_pos_ratio: float = 1e-5,
     wrinkle_neg_pos_ratio: float = 2.0,
     max_wrinkle_negative_if_no_positive: int = 0,
-    centered_red_patches: int = 128,
-    centered_wrinkle_patches: int = 128,
-    centered_jitter: int = 64,
+    centered_red_patches: int = 48,
+    centered_wrinkle_patches: int = 48,
+    centered_jitter: int = 32,
     centered_min_mask_coverage: float = 0.5,
     centered_seed: int = 42,
     max_patches_per_subject: int | None = None,
+    patch_dedup_iou: float = 0.80,
     disable_mediapipe: bool = False,
     face_landmarker_task_path: str | None = None,
 ) -> None:
@@ -405,6 +469,11 @@ def prepare_v3(
                     neg_pos_ratio=neg_pos_ratio,
                     max_negative_if_no_positive=max_negative_if_no_positive,
                 )
+                main_selected, main_dedup_dropped = dedup_selected_patches(
+                    main_selected,
+                    patch_size=patch_size,
+                    dedup_iou_threshold=patch_dedup_iou,
+                )
                 subject_selected.extend(
                     _annotate_stream_candidates(
                         main_selected,
@@ -414,7 +483,7 @@ def prepare_v3(
                         has_wrinkle=False,
                     )
                 )
-                print(f"  main stream: selected={len(main_selected)}")
+                print(f"  main stream: selected={len(main_selected)} dedup_dropped={main_dedup_dropped}")
             else:
                 print("  main stream: skip")
 
@@ -457,6 +526,11 @@ def prepare_v3(
                     neg_pos_ratio=wrinkle_neg_pos_ratio,
                     max_negative_if_no_positive=max_wrinkle_negative_if_no_positive,
                 )
+                wrinkle_selected, wrinkle_dedup_dropped = dedup_selected_patches(
+                    wrinkle_selected,
+                    patch_size=patch_size,
+                    dedup_iou_threshold=patch_dedup_iou,
+                )
                 subject_selected.extend(
                     _annotate_stream_candidates(
                         wrinkle_selected,
@@ -466,7 +540,7 @@ def prepare_v3(
                         has_wrinkle=True,
                     )
                 )
-                print(f"  wrinkle stream: selected={len(wrinkle_selected)}")
+                print(f"  wrinkle stream: selected={len(wrinkle_selected)} dedup_dropped={wrinkle_dedup_dropped}")
             else:
                 print("  wrinkle stream: skip")
 
@@ -537,12 +611,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wrinkle_min_pos_ratio", type=float, default=1e-5)
     parser.add_argument("--wrinkle_neg_pos_ratio", type=float, default=2.0)
     parser.add_argument("--max_wrinkle_negative_if_no_positive", type=int, default=0)
-    parser.add_argument("--centered_red_patches", type=int, default=128)
-    parser.add_argument("--centered_wrinkle_patches", type=int, default=128)
-    parser.add_argument("--centered_jitter", type=int, default=64)
+    parser.add_argument("--centered_red_patches", type=int, default=48)
+    parser.add_argument("--centered_wrinkle_patches", type=int, default=48)
+    parser.add_argument("--centered_jitter", type=int, default=32)
     parser.add_argument("--centered_min_mask_coverage", type=float, default=0.5)
     parser.add_argument("--centered_seed", type=int, default=42)
     parser.add_argument("--max_patches_per_subject", type=int, default=0)
+    parser.add_argument("--patch_dedup_iou", type=float, default=0.80)
     parser.add_argument("--disable_mediapipe", action="store_true")
     parser.add_argument("--face_landmarker_task_path", default=None)
     return parser.parse_args()
@@ -571,6 +646,7 @@ def main() -> None:
         max_patches_per_subject=(
             args.max_patches_per_subject if args.max_patches_per_subject > 0 else None
         ),
+        patch_dedup_iou=args.patch_dedup_iou,
         disable_mediapipe=args.disable_mediapipe,
         face_landmarker_task_path=args.face_landmarker_task_path,
     )
