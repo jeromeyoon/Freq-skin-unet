@@ -818,18 +818,34 @@ def prune_saved_patches(
     return keep
 
 
+def _has_curr_red(subject_name: str, gt_maps: dict) -> bool:
+    """Return True if the subject's matched red GT file is specialist-corrected (curr)."""
+    path = find_matching_gt(subject_name, gt_maps["red"])
+    if path is None:
+        return False
+    return "curr" in path.stem.lower()
+
+
 def _score_subject(subject_name: str, gt_maps: dict) -> int:
     """
     Score a subject by GT annotation richness (no image loading).
 
-    wrinkle=4 : rarest and most critical for training
-    red=2     : sparse specialist labels
-    brown=1   : relatively common
+    Priority rationale (data: 3510 subjects total):
+      wrinkle GT    : +4  — 2549 subjects; rarest task, hardest to learn
+      red curr GT   : +3  — 1362 subjects; specialist-corrected, most reliable
+      red (regular) : +2  — 3178 total red; auto/non-specialist annotation
+      brown GT      : +1  — 1823 subjects; common, stable labels
+
+    Max score = 8 (wrinkle + red_curr + brown).
+    Wrinkle subjects (2549) outnumber the 2000 target, so the top 2000 will
+    all have wrinkle GT; secondary scores break ties among wrinkle subjects.
     """
     score = 0
     if find_matching_gt(subject_name, gt_maps["wrinkle"]) is not None:
         score += 4
-    if find_matching_gt(subject_name, gt_maps["red"]) is not None:
+    if _has_curr_red(subject_name, gt_maps):
+        score += 3  # specialist-corrected red > regular red
+    elif find_matching_gt(subject_name, gt_maps["red"]) is not None:
         score += 2
     if find_matching_gt(subject_name, gt_maps["brown"]) is not None:
         score += 1
@@ -849,13 +865,23 @@ def _select_top_subjects(
     # Stable sort: score descending, name ascending as tie-break.
     scored.sort(key=lambda t: (-t[1], t[0].name))
     selected = [d for d, _ in scored[:max_subjects]]
+
     n_total = len(subject_dirs)
-    n_wrinkle = sum(1 for _, s in scored[:max_subjects] if s >= 4)
-    n_red = sum(1 for _, s in scored[:max_subjects] if s & 2)
-    n_brown = sum(1 for _, s in scored[:max_subjects] if s & 1)
+    n_wrinkle  = sum(1 for d in selected if find_matching_gt(d.name, gt_maps["wrinkle"]) is not None)
+    n_red_curr = sum(1 for d in selected if _has_curr_red(d.name, gt_maps))
+    n_red      = sum(1 for d in selected if find_matching_gt(d.name, gt_maps["red"]) is not None)
+    n_brown    = sum(1 for d in selected if find_matching_gt(d.name, gt_maps["brown"]) is not None)
+
+    # Score distribution of selected subjects
+    from collections import Counter
+    score_dist = Counter(s for _, s in scored[:max_subjects])
     print(
-        f"[subject-select] {n_total} → {len(selected)} subjects selected "
-        f"(wrinkle GT={n_wrinkle}, red GT={n_red}, brown GT={n_brown})"
+        f"[subject-select] {n_total} → {len(selected)} subjects selected\n"
+        f"  wrinkle GT : {n_wrinkle}\n"
+        f"  red curr   : {n_red_curr}  (specialist-corrected)\n"
+        f"  red total  : {n_red}\n"
+        f"  brown GT   : {n_brown}\n"
+        f"  score dist : { {k: score_dist[k] for k in sorted(score_dist, reverse=True)} }"
     )
     return selected
 

@@ -4,12 +4,30 @@ new_data_prep_2000.py
 3510장 입력 이미지에서 퀄리티 기준 상위 2000장(subject)을 선별한 뒤
 패치를 생성하는 엔트리포인트.
 
+데이터 현황 (2024 기준)
+-----------------------
+  rgb_cross / rgb_parallel : 3510명 전원 보유
+  wrinkle GT               : 2549명 (72.6%) ← 선별 목표 2000보다 많음
+  red GT                   : 3178명 (90.5%)
+    - 전문의 수정 curr      : 1362명 포함
+  brown GT                 : 1823명 (51.9%)
+
 Subject 선별 기준 (이미지 로딩 없이 GT 보유 여부만 확인)
 ---------------------------------------------------------
-  wrinkle GT 보유 : +4점  (가장 희소하고 학습에 중요)
-  red GT 보유     : +2점
-  brown GT 보유   : +1점
-  동점이면 subject 이름 오름차순
+  wrinkle GT 보유      : +4점  wrinkle 2549명 > 목표 2000명이므로
+                                상위 2000은 모두 wrinkle 보유 예정
+  red curr GT 보유     : +3점  전문의 수정본, 신뢰도 최고
+  red (일반) GT 보유   : +2점
+  brown GT 보유        : +1점
+  동점이면 subject 이름 오름차순 (재현성 보장)
+
+  예상 선별 결과 (wrinkle 2549명 중 상위 2000):
+    wrinkle + red_curr + brown : score 8  (최우선)
+    wrinkle + red_curr         : score 7
+    wrinkle + red + brown      : score 7
+    wrinkle + red              : score 6
+    wrinkle + brown            : score 5
+    wrinkle only               : score 4  (나머지)
 
 패치 생성 전략
 --------------
@@ -19,10 +37,10 @@ Subject 선별 기준 (이미지 로딩 없이 GT 보유 여부만 확인)
 
 패치 수 제한 없음
 -----------------
-  max_subjects=2000 으로 입력 subject 수를 제어.
+  max_subjects=2000으로 입력 subject 수를 제어.
   패치 자체에는 인위적 상한을 두지 않는다.
   Subject당 평균 12~20장이므로 총 24,000~40,000장 예상.
-  너무 많다면 --max_patches_per_subject 으로 조절.
+  너무 많다면 --max_patches_per_subject으로 조절.
 """
 
 from __future__ import annotations
