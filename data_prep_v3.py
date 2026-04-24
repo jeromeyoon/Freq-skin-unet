@@ -204,7 +204,13 @@ def _select_candidates(
     return positives + [neg for i, neg in enumerate(negatives) if i in neg_keep_indices]
 
 
-def _same_size_patch_iou(a: dict, b: dict, patch_size: int) -> float:
+def _same_size_patch_overlap(a: dict, b: dict, patch_size: int) -> float:
+    """두 패치의 겹치는 면적을 단일 패치 면적 대비 비율로 반환 (0~1).
+
+    IoU(Jaccard) 대신 단순 overlap ratio를 사용한다.
+    "25% 이상 겹치지 않게" 라는 조건은 inter/area < 0.25 이며,
+    이것이 IoU (inter/union) 보다 직관적으로 중복 한계를 표현한다.
+    """
     ay1, ax1 = int(a["y"]), int(a["x"])
     by1, bx1 = int(b["y"]), int(b["x"])
     ay2, ax2 = ay1 + patch_size, ax1 + patch_size
@@ -216,9 +222,7 @@ def _same_size_patch_iou(a: dict, b: dict, patch_size: int) -> float:
     if inter <= 0:
         return 0.0
 
-    area = patch_size * patch_size
-    union = area + area - inter
-    return float(inter) / max(float(union), 1.0)
+    return float(inter) / float(patch_size * patch_size)
 
 
 def _annotate_stream_candidates(
@@ -266,9 +270,14 @@ def _stream_patch_quality(patch: dict) -> tuple:
 def dedup_selected_patches(
     selected_patches: list[dict],
     patch_size: int,
-    dedup_iou_threshold: float,
+    max_overlap_fraction: float,
 ) -> tuple[list[dict], int]:
-    if dedup_iou_threshold <= 0.0 or len(selected_patches) <= 1:
+    """중복 패치 제거: 이미 선택된 패치와의 overlap ratio >= max_overlap_fraction 이면 드롭.
+
+    high-quality 패치를 먼저 유지하기 위해 _stream_patch_quality로 내림차순 정렬 후
+    탐욕적(greedy) 선택을 수행한다.
+    """
+    if max_overlap_fraction <= 0.0 or len(selected_patches) <= 1:
         return selected_patches, 0
 
     ranked = sorted(
@@ -279,11 +288,59 @@ def dedup_selected_patches(
     kept: list[dict] = []
     dropped = 0
     for cand in ranked:
-        if any(_same_size_patch_iou(cand, prev, patch_size) >= dedup_iou_threshold for prev in kept):
+        if any(
+            _same_size_patch_overlap(cand, prev, patch_size) >= max_overlap_fraction
+            for prev in kept
+        ):
             dropped += 1
             continue
         kept.append(cand)
     return kept, dropped
+
+
+def select_subjects(
+    subject_dirs: list[Path],
+    gt_maps: dict[str, dict],
+    max_subjects: int | None,
+    unused_path: Path | None,
+) -> tuple[list[Path], list[Path]]:
+    """GT 우선순위 기반으로 max_subjects명을 선택하고 나머지를 unused_path에 저장.
+
+    선택 기준 (내림차순):
+      wrinkle GT 보유 → 4점
+      red     GT 보유 → 2점
+      brown   GT 보유 → 1점
+      점수가 같을 경우 subject 이름 오름차순 (재현성 보장)
+
+    모든 GT를 갖춘 사람이 우선 포함되어 학습 데이터 품질이 최대화된다.
+    """
+    if max_subjects is None or max_subjects <= 0 or max_subjects >= len(subject_dirs):
+        return list(subject_dirs), []
+
+    def _score(subj_dir: Path) -> int:
+        name = subj_dir.name
+        score = 0
+        if find_matching_gt(name, gt_maps.get("wrinkle", {})):
+            score += 4
+        if find_matching_gt(name, gt_maps.get("red", {})):
+            score += 2
+        if find_matching_gt(name, gt_maps.get("brown", {})):
+            score += 1
+        return score
+
+    scored = sorted(subject_dirs, key=lambda d: (-_score(d), d.name))
+    selected = scored[:max_subjects]
+    unused   = scored[max_subjects:]
+
+    print(f"Subject 선택: {len(selected)}명 사용 / {len(unused)}명 미사용 (전체 {len(subject_dirs)}명)")
+
+    if unused_path is not None and unused:
+        with open(unused_path, "w", encoding="utf-8") as f:
+            for d in unused:
+                f.write(d.name + "\n")
+        print(f"미사용 subject 목록 → {unused_path}")
+
+    return selected, unused
 
 
 def _combined_patch_quality(patch: dict) -> tuple:
@@ -378,7 +435,8 @@ def prepare_v3(
     centered_min_mask_coverage: float = 0.5,
     centered_seed: int = 42,
     max_patches_per_subject: int | None = None,
-    patch_dedup_iou: float = 0.80,
+    patch_max_overlap: float = 0.25,
+    max_subjects: int | None = None,
     disable_mediapipe: bool = False,
     face_landmarker_task_path: str | None = None,
 ) -> None:
@@ -403,8 +461,16 @@ def prepare_v3(
         f"parallel(F_11)={len(wrinkle_img_maps['parallel'])}"
     )
 
-    subject_dirs = sorted([d for d in input_root.iterdir() if d.is_dir()])
-    print(f"input ID 수: {len(subject_dirs)}")
+    all_subject_dirs = sorted([d for d in input_root.iterdir() if d.is_dir()])
+    print(f"input ID 수 (전체): {len(all_subject_dirs)}")
+
+    unused_subjects_path = out_root / "unused_subjects.txt"
+    subject_dirs, unused_dirs = select_subjects(
+        all_subject_dirs,
+        gt_maps,
+        max_subjects=max_subjects,
+        unused_path=unused_subjects_path if max_subjects else None,
+    )
 
     manifest: dict[str, dict] = {}
     skipped = []
@@ -472,7 +538,7 @@ def prepare_v3(
                 main_selected, main_dedup_dropped = dedup_selected_patches(
                     main_selected,
                     patch_size=patch_size,
-                    dedup_iou_threshold=patch_dedup_iou,
+                    max_overlap_fraction=patch_max_overlap,
                 )
                 subject_selected.extend(
                     _annotate_stream_candidates(
@@ -529,7 +595,7 @@ def prepare_v3(
                 wrinkle_selected, wrinkle_dedup_dropped = dedup_selected_patches(
                     wrinkle_selected,
                     patch_size=patch_size,
-                    dedup_iou_threshold=patch_dedup_iou,
+                    max_overlap_fraction=patch_max_overlap,
                 )
                 subject_selected.extend(
                     _annotate_stream_candidates(
@@ -617,7 +683,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--centered_min_mask_coverage", type=float, default=0.5)
     parser.add_argument("--centered_seed", type=int, default=42)
     parser.add_argument("--max_patches_per_subject", type=int, default=0)
-    parser.add_argument("--patch_dedup_iou", type=float, default=0.80)
+    parser.add_argument(
+        "--patch_max_overlap", type=float, default=0.25,
+        help="두 패치의 겹치는 면적이 단일 패치 면적의 이 비율 이상이면 중복 제거 (기본 0.25 = 25%%)",
+    )
+    parser.add_argument(
+        "--max_subjects", type=int, default=0,
+        help="사용할 최대 subject 수. 0이면 전체 사용. GT 우선순위(wrinkle>red>brown)로 선택.",
+    )
     parser.add_argument("--disable_mediapipe", action="store_true")
     parser.add_argument("--face_landmarker_task_path", default=None)
     return parser.parse_args()
@@ -646,7 +719,8 @@ def main() -> None:
         max_patches_per_subject=(
             args.max_patches_per_subject if args.max_patches_per_subject > 0 else None
         ),
-        patch_dedup_iou=args.patch_dedup_iou,
+        patch_max_overlap=args.patch_max_overlap,
+        max_subjects=args.max_subjects if args.max_subjects > 0 else None,
         disable_mediapipe=args.disable_mediapipe,
         face_landmarker_task_path=args.face_landmarker_task_path,
     )
