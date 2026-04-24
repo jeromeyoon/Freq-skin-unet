@@ -1,13 +1,18 @@
 """
 new_data_prep_2000.py
 =====================
-Standalone entrypoint for building a "good 2000 patches" dataset.
+Standalone entrypoint for building a quality-selected patch dataset.
 
-This script uses the implementation in new_data_prep.py, but exposes its own
-CLI entrypoint with defaults tuned for a smaller, higher-quality dataset:
+Defaults are tuned to avoid the two failure modes:
+  - too many patches (original new_data_prep): memory / training overhead
+  - too few patches (old 2000 preset):  wrinkle-positive subjects under-sampled
 
-- max_total_patches      = 2000
-- max_patches_per_subject = 12
+Key parameters and their effect:
+  stride=128            : overlapping grid (was 256). Doubles candidate count.
+                          Adjacent IoU ≈ 33 % → stays below dedup threshold 0.80.
+  max_patches_per_subject=30 : allows wrinkle-rich subjects to contribute more
+                          patches before the global quality prune (was 12).
+  max_total_patches=5000 : final global cap after per-subject generation (was 2000).
 """
 
 from __future__ import annotations
@@ -23,9 +28,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--input_path", required=True)
     parser.add_argument("--gt_path", required=True)
-    parser.add_argument("--patch_dir", default="./patches_2000")
+    parser.add_argument("--patch_dir", default="./patches_5000")
     parser.add_argument("--patch_size", type=int, default=256)
-    parser.add_argument("--stride", type=int, default=256)
+    parser.add_argument("--stride", type=int, default=128,
+                        help="patch stride; 128 gives ~5x more candidates than 256 "
+                             "with IoU≈33%% (below the 0.80 dedup threshold)")
     parser.add_argument("--min_mask_coverage", type=float, default=0.7)
     parser.add_argument(
         "--no_apply_mask",
@@ -111,14 +118,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max_total_patches",
         type=int,
-        default=2000,
-        help="final total patch limit (default: 2000)",
+        default=5000,
+        help="final total patch limit after global quality prune (default: 5000)",
     )
     parser.add_argument(
         "--max_patches_per_subject",
         type=int,
-        default=12,
-        help="max patches kept per subject before final global prune",
+        default=30,
+        help="max patches saved per subject before global prune (default: 30); "
+             "raise for wrinkle-rich subjects, lower to enforce diversity",
     )
     parser.add_argument(
         "--patch_dedup_iou",
