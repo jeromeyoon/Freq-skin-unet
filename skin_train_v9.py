@@ -59,7 +59,7 @@ CFG = dict(
     high_r=0.4,
     img_size=256,
 
-    epochs=100,
+    epochs=50,
     batch_size=16,
     lr=1e-4,
     weight_decay=1e-4,
@@ -75,7 +75,7 @@ CFG = dict(
     best_w_red=1.0,
     best_w_wrinkle=1.2,
 
-    aug_warmup_epochs=30,
+    aug_warmup_epochs=15,
     intensity_range=(0.6, 1.4),
     color_temp_range=(0.7, 1.3),
     tint_range=(0.8, 1.2),
@@ -124,7 +124,9 @@ CFG = dict(
     # dominated by the stronger brown/red gradient in early training.
     # Extended 5→15: ParallelPolEncoder high-freq gate starts at sigmoid(-2)≈0.12
     # and needs more epochs to open before brown/red gradients compete.
-    wrinkle_solo_epochs=15,
+    wrinkle_solo_epochs=8,
+    # Curriculum Tversky ramp length (epochs). Set to ~30% of total epochs.
+    wrinkle_tversky_ramp_epochs=15,
 
     seed=42,
     preview_interval=10,
@@ -1153,8 +1155,9 @@ def main():
         # to high beta causes excessive FP in early training when the model hasn't
         # yet learned what a wrinkle looks like.
         tversky_beta_target = CFG['wrinkle_tversky_beta']
+        tversky_ramp = CFG.get('wrinkle_tversky_ramp_epochs', max(CFG['epochs'] // 3, 1))
         criterion.wrinkle_tversky_beta = 0.5 + (tversky_beta_target - 0.5) * min(
-            epoch / 30.0, 1.0
+            epoch / tversky_ramp, 1.0
         )
 
         # Wrinkle-solo warmup: suppress brown/red loss for the first N epochs so
