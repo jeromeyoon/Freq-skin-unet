@@ -412,6 +412,16 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         self.wrinkle_edge_weight = wrinkle_edge_weight
         self.wrinkle_gt_dilation = wrinkle_gt_dilation
 
+        # Pre-built edge kernels (registered as buffers so device moves work).
+        self.register_buffer(
+            '_gauss_k',
+            torch.tensor([[1., 2., 1.], [2., 4., 2.], [1., 2., 1.]]).view(1, 1, 3, 3) / 16.0,
+        )
+        self.register_buffer(
+            '_sobel_x',
+            torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]).view(1, 1, 3, 3),
+        )
+
     @staticmethod
     def _avail_tensor(has_gt, device):
         return torch.tensor(has_gt, dtype=torch.float32, device=device)
@@ -575,15 +585,8 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         prob = torch.sigmoid(pred) * face_mask
         gt_m = gt * face_mask
 
-        gauss_k = torch.tensor(
-            [[1., 2., 1.], [2., 4., 2.], [1., 2., 1.]],
-            device=pred.device, dtype=prob.dtype,
-        ).view(1, 1, 3, 3) / 16.0
-
-        sobel_x = torch.tensor(
-            [[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
-            device=pred.device, dtype=prob.dtype,
-        ).view(1, 1, 3, 3)
+        gauss_k = self._gauss_k.to(dtype=prob.dtype)
+        sobel_x = self._sobel_x.to(dtype=prob.dtype)
         sobel_y = sobel_x.transpose(2, 3).contiguous()
 
         def _smooth_edge(x: torch.Tensor) -> torch.Tensor:
@@ -1157,7 +1160,8 @@ def main():
         # Wrinkle-solo warmup: suppress brown/red loss for the first N epochs so
         # the wrinkle head receives undiluted gradient before competing tasks
         # dominate the shared encoder.
-        if 0 < epoch <= solo_epochs:
+        in_solo = 0 < epoch <= solo_epochs
+        if in_solo:
             criterion.w_brown = 0.0
             criterion.w_red = 0.0
             criterion.w_recon = 0.0
@@ -1176,6 +1180,13 @@ def main():
             epoch,
             CFG['epochs'],
         )
+
+        # Restore full task weights before validation so val metrics are always
+        # comparable across all epochs (solo epoch training zeros w_brown/w_red).
+        if in_solo:
+            for k, v in weights.items():
+                setattr(criterion, k, v)
+
         # Validation remains all-task, so val metrics are comparable to V7/V8.
         val_log = validate_fast(model, val_loader, criterion, device, CFG)
         scheduler.step()
