@@ -1,18 +1,28 @@
 """
 new_data_prep_2000.py
 =====================
-Standalone entrypoint for building a quality-selected patch dataset.
+3510장 입력 이미지에서 퀄리티 기준 상위 2000장(subject)을 선별한 뒤
+패치를 생성하는 엔트리포인트.
 
-Defaults are tuned to avoid the two failure modes:
-  - too many patches (original new_data_prep): memory / training overhead
-  - too few patches (old 2000 preset):  wrinkle-positive subjects under-sampled
+Subject 선별 기준 (이미지 로딩 없이 GT 보유 여부만 확인)
+---------------------------------------------------------
+  wrinkle GT 보유 : +4점  (가장 희소하고 학습에 중요)
+  red GT 보유     : +2점
+  brown GT 보유   : +1점
+  동점이면 subject 이름 오름차순
 
-Key parameters and their effect:
-  stride=128            : overlapping grid (was 256). Doubles candidate count.
-                          Adjacent IoU ≈ 33 % → stays below dedup threshold 0.80.
-  max_patches_per_subject=30 : allows wrinkle-rich subjects to contribute more
-                          patches before the global quality prune (was 12).
-  max_total_patches=5000 : final global cap after per-subject generation (was 2000).
+패치 생성 전략
+--------------
+  stride=256 : 256×256 패치 간 overlap 없음 (중복 패치 방지)
+  centered    : wrinkle/red 레이블 중심 패치 추가 생성 (희소 레이블 보강)
+  dedup       : IoU ≥ 0.80 인접 패치 제거
+
+패치 수 제한 없음
+-----------------
+  max_subjects=2000 으로 입력 subject 수를 제어.
+  패치 자체에는 인위적 상한을 두지 않는다.
+  Subject당 평균 12~20장이므로 총 24,000~40,000장 예상.
+  너무 많다면 --max_patches_per_subject 으로 조절.
 """
 
 from __future__ import annotations
@@ -24,15 +34,17 @@ from new_data_prep import prepare
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="VISIA patch generator (2000-patch quality-selected preset)"
+        description="VISIA patch generator — quality-based subject selection"
     )
-    parser.add_argument("--input_path", required=True)
-    parser.add_argument("--gt_path", required=True)
-    parser.add_argument("--patch_dir", default="./patches_5000")
+    parser.add_argument("--input_path", required=True,
+                        help="root directory containing all subject folders")
+    parser.add_argument("--gt_path", required=True,
+                        help="root directory of GT annotations")
+    parser.add_argument("--patch_dir", default="./patches",
+                        help="output patch directory")
     parser.add_argument("--patch_size", type=int, default=256)
-    parser.add_argument("--stride", type=int, default=128,
-                        help="patch stride; 128 gives ~5x more candidates than 256 "
-                             "with IoU≈33%% (below the 0.80 dedup threshold)")
+    parser.add_argument("--stride", type=int, default=256,
+                        help="sliding window stride; 256 = no overlap between grid patches")
     parser.add_argument("--min_mask_coverage", type=float, default=0.7)
     parser.add_argument(
         "--no_apply_mask",
@@ -49,13 +61,13 @@ def parse_args() -> argparse.Namespace:
         "--max_negative_if_no_positive",
         type=int,
         default=0,
-        help="max generic negatives to keep when no positive exists",
+        help="max generic negatives to keep when subject has no positive patch",
     )
     parser.add_argument(
         "--wrinkle_min_pos_ratio",
         type=float,
         default=1e-5,
-        help="minimum positive ratio to mark a wrinkle patch as positive",
+        help="minimum positive pixel ratio to mark a wrinkle patch as positive",
     )
     parser.add_argument(
         "--wrinkle_neg_pos_ratio",
@@ -67,12 +79,12 @@ def parse_args() -> argparse.Namespace:
         "--max_wrinkle_negative_if_no_positive",
         type=int,
         default=0,
-        help="max wrinkle negatives to keep when no wrinkle positive exists",
+        help="max wrinkle negatives when subject has no wrinkle positive",
     )
     parser.add_argument(
         "--centered_tasks",
         default="red,wrinkle",
-        help="tasks that receive extra positive-centered patch candidates",
+        help="tasks that get extra positive-centered patch candidates",
     )
     parser.add_argument(
         "--centered_patches_per_task",
@@ -84,7 +96,7 @@ def parse_args() -> argparse.Namespace:
         "--centered_jitter",
         type=int,
         default=64,
-        help="jitter radius for positive-centered crop sampling",
+        help="jitter radius (px) for positive-centered crop sampling",
     )
     parser.add_argument(
         "--centered_min_mask_coverage",
@@ -96,7 +108,6 @@ def parse_args() -> argparse.Namespace:
         "--centered_seed",
         type=int,
         default=42,
-        help="seed for positive-centered sampling",
     )
     parser.add_argument(
         "--disable_mediapipe",
@@ -107,38 +118,57 @@ def parse_args() -> argparse.Namespace:
         "--face_landmarker_task_path",
         type=str,
         default=None,
-        help="path to MediaPipe face_landmarker.task",
+        help="path to MediaPipe face_landmarker.task model",
     )
     parser.add_argument(
         "--num_workers",
         type=int,
         default=1,
-        help="number of subject-level workers",
+        help="number of parallel subject-level workers",
     )
+    # ── Subject selection ──────────────────────────────────────────────────
     parser.add_argument(
-        "--max_total_patches",
+        "--max_subjects",
         type=int,
-        default=5000,
-        help="final total patch limit after global quality prune (default: 5000)",
+        default=2000,
+        help="select this many top-quality subjects from all inputs "
+             "(ranked by GT richness: wrinkle=4pt, red=2pt, brown=1pt); "
+             "set 0 to disable and process all subjects",
     )
+    # ── Per-subject patch cap ──────────────────────────────────────────────
     parser.add_argument(
         "--max_patches_per_subject",
         type=int,
-        default=30,
-        help="max patches saved per subject before global prune (default: 30); "
-             "raise for wrinkle-rich subjects, lower to enforce diversity",
+        default=0,
+        help="hard cap on patches saved per subject (0 = no limit); "
+             "use only if disk space or training time is a concern",
     )
+    # ── Dedup ──────────────────────────────────────────────────────────────
     parser.add_argument(
         "--patch_dedup_iou",
         type=float,
         default=0.80,
-        help="IoU threshold for removing near-duplicate overlapping patches",
+        help="IoU threshold for removing near-duplicate overlapping patches "
+             "(default 0.80; lower = more aggressive dedup)",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    max_subjects = args.max_subjects if args.max_subjects > 0 else None
+    max_patches_per_subject = (
+        args.max_patches_per_subject if args.max_patches_per_subject > 0 else None
+    )
+
+    print("=== new_data_prep_2000: quality-based subject selection ===")
+    print(f"  max_subjects          : {max_subjects or 'all'}")
+    print(f"  stride                : {args.stride} px (no overlap)")
+    print(f"  patch_dedup_iou       : {args.patch_dedup_iou}")
+    print(f"  max_patches_per_subject: {max_patches_per_subject or 'no limit'}")
+    print(f"  max_total_patches     : no limit (controlled by subject count)")
+
     prepare(
         input_path=args.input_path,
         gt_path=args.gt_path,
@@ -153,7 +183,7 @@ def main() -> None:
         wrinkle_neg_pos_ratio=args.wrinkle_neg_pos_ratio,
         max_wrinkle_negative_if_no_positive=args.max_wrinkle_negative_if_no_positive,
         centered_tasks=tuple(
-            task.strip() for task in args.centered_tasks.split(",") if task.strip()
+            t.strip() for t in args.centered_tasks.split(",") if t.strip()
         ),
         centered_patches_per_task=args.centered_patches_per_task,
         centered_jitter=args.centered_jitter,
@@ -162,8 +192,9 @@ def main() -> None:
         disable_mediapipe=args.disable_mediapipe,
         face_landmarker_task_path=args.face_landmarker_task_path,
         num_workers=args.num_workers,
-        max_total_patches=args.max_total_patches,
-        max_patches_per_subject=args.max_patches_per_subject,
+        max_subjects=max_subjects,
+        max_total_patches=None,          # subject 수로 제어, 패치 수 무제한
+        max_patches_per_subject=max_patches_per_subject,
         patch_dedup_iou=args.patch_dedup_iou,
     )
 

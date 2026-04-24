@@ -818,6 +818,48 @@ def prune_saved_patches(
     return keep
 
 
+def _score_subject(subject_name: str, gt_maps: dict) -> int:
+    """
+    Score a subject by GT annotation richness (no image loading).
+
+    wrinkle=4 : rarest and most critical for training
+    red=2     : sparse specialist labels
+    brown=1   : relatively common
+    """
+    score = 0
+    if find_matching_gt(subject_name, gt_maps["wrinkle"]) is not None:
+        score += 4
+    if find_matching_gt(subject_name, gt_maps["red"]) is not None:
+        score += 2
+    if find_matching_gt(subject_name, gt_maps["brown"]) is not None:
+        score += 1
+    return score
+
+
+def _select_top_subjects(
+    subject_dirs: list,
+    gt_maps: dict,
+    max_subjects: int,
+) -> list:
+    """Select the top-quality subjects by GT richness score."""
+    scored = [
+        (d, _score_subject(d.name, gt_maps))
+        for d in subject_dirs
+    ]
+    # Stable sort: score descending, name ascending as tie-break.
+    scored.sort(key=lambda t: (-t[1], t[0].name))
+    selected = [d for d, _ in scored[:max_subjects]]
+    n_total = len(subject_dirs)
+    n_wrinkle = sum(1 for _, s in scored[:max_subjects] if s >= 4)
+    n_red = sum(1 for _, s in scored[:max_subjects] if s & 2)
+    n_brown = sum(1 for _, s in scored[:max_subjects] if s & 1)
+    print(
+        f"[subject-select] {n_total} → {len(selected)} subjects selected "
+        f"(wrinkle GT={n_wrinkle}, red GT={n_red}, brown GT={n_brown})"
+    )
+    return selected
+
+
 def prepare(
     input_path: str,
     gt_path: str,
@@ -839,8 +881,9 @@ def prepare(
     disable_mediapipe: bool = False,
     face_landmarker_task_path: str | None = None,
     num_workers: int = 1,
-    max_total_patches: int = 2000,
-    max_patches_per_subject: int = 12,
+    max_subjects: int | None = None,
+    max_total_patches: int | None = None,
+    max_patches_per_subject: int | None = None,
     patch_dedup_iou: float = 0.80,
 ) -> None:
     input_root = Path(input_path)
@@ -860,6 +903,9 @@ def prepare(
 
     subject_dirs = sorted([d for d in input_root.iterdir() if d.is_dir()])
     print(f"input ID 수: {len(subject_dirs)}")
+
+    if max_subjects and max_subjects > 0 and len(subject_dirs) > max_subjects:
+        subject_dirs = _select_top_subjects(subject_dirs, gt_maps, max_subjects)
 
     manifest: dict[str, dict] = {}
     total_patches = 0
