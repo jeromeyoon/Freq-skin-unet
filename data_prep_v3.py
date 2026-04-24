@@ -113,7 +113,6 @@ def _collect_patch_candidates(
     stride: int,
     min_mask_coverage: float,
     apply_mask: bool,
-    mask_gt_on_save: bool,
     centered_tasks: tuple[str, ...],
     centered_patches_per_task: int,
     centered_jitter: int,
@@ -164,11 +163,7 @@ def _collect_patch_candidates(
             gt_patch_for_ratio = (
                 apply_mask_to_gray(gt_patch, m_p) if apply_mask else gt_patch
             )
-            gt_patch_save = (
-                apply_mask_to_gray(gt_patch, m_p)
-                if (apply_mask and mask_gt_on_save)
-                else gt_patch
-            )
+            gt_patch_save = apply_mask_to_gray(gt_patch, m_p) if apply_mask else gt_patch
             gt_patch_map[task] = gt_patch_save
 
             pos_ratio = float((gt_patch_for_ratio > 127).sum()) / max(float(gt_patch_for_ratio.size), 1.0)
@@ -209,6 +204,50 @@ def _select_candidates(
     return positives + [neg for i, neg in enumerate(negatives) if i in neg_keep_indices]
 
 
+def _annotate_stream_candidates(
+    selected_patches: list[dict],
+    *,
+    stream_name: str,
+    has_brown: bool,
+    has_red: bool,
+    has_wrinkle: bool,
+) -> list[dict]:
+    out = []
+    for patch in selected_patches:
+        item = dict(patch)
+        item["_stream_name"] = stream_name
+        item["_has_brown"] = has_brown
+        item["_has_red"] = has_red
+        item["_has_wrinkle"] = has_wrinkle
+        out.append(item)
+    return out
+
+
+def _combined_patch_quality(patch: dict) -> tuple:
+    wrinkle_ratio = float(patch["gt_pos_ratios"].get("wrinkle_pos_ratio", 0.0))
+    red_ratio = float(patch["gt_pos_ratios"].get("red_pos_ratio", 0.0))
+    brown_ratio = float(patch["gt_pos_ratios"].get("brown_pos_ratio", 0.0))
+
+    wrinkle_pos = int(wrinkle_ratio > 0.0)
+    red_pos = int(red_ratio > 0.0)
+    brown_pos = int(brown_ratio > 0.0)
+    positive_task_count = wrinkle_pos + red_pos + brown_pos
+    is_positive = int(patch.get("is_positive", False))
+    wrinkle_stream = int(patch.get("_stream_name") == "wrinkle")
+
+    return (
+        wrinkle_pos,
+        positive_task_count,
+        wrinkle_stream,
+        red_pos,
+        brown_pos,
+        min(wrinkle_ratio, 1.0),
+        min(red_ratio, 1.0),
+        min(brown_ratio, 1.0),
+        is_positive,
+    )
+
+
 def save_stream_patches(
     *,
     out_root: Path,
@@ -220,7 +259,6 @@ def save_stream_patches(
     has_wrinkle: bool,
     wrinkle_min_pos_ratio: float,
     apply_mask: bool,
-    mask_gt_on_save: bool,
     manifest: dict[str, dict],
 ) -> int:
     saved = 0
@@ -248,7 +286,7 @@ def save_stream_patches(
             "has_red": has_red,
             "has_wrinkle": has_wrinkle_patch,
             "mask_applied": apply_mask,
-            "gt_mask_applied": bool(apply_mask and mask_gt_on_save),
+            "gt_mask_applied": bool(apply_mask),
             "is_positive": patch["is_positive"],
             "is_wrinkle_positive": has_wrinkle_patch,
             "is_wrinkle_negative": has_wrinkle and not has_wrinkle_patch,
@@ -266,7 +304,6 @@ def prepare_v3(
     stride: int = 256,
     min_mask_coverage: float = 0.7,
     apply_mask: bool = True,
-    mask_gt_on_save: bool = True,
     neg_pos_ratio: float = 2.0,
     max_negative_if_no_positive: int = 0,
     wrinkle_min_pos_ratio: float = 1e-5,
@@ -277,6 +314,7 @@ def prepare_v3(
     centered_jitter: int = 64,
     centered_min_mask_coverage: float = 0.5,
     centered_seed: int = 42,
+    max_patches_per_subject: int | None = None,
     disable_mediapipe: bool = False,
     face_landmarker_task_path: str | None = None,
 ) -> None:
@@ -323,6 +361,7 @@ def prepare_v3(
             wrinkle_gt = find_matching_gt(subject_name, gt_maps["wrinkle"])
 
             saved_this_subject = 0
+            subject_selected: list[dict] = []
 
             # Main stream: brown / red on original F_10/F_11
             if main_cross_path.exists() and main_parallel_path.exists() and (brown_gt or red_gt):
@@ -354,7 +393,6 @@ def prepare_v3(
                     stride=stride,
                     min_mask_coverage=min_mask_coverage,
                     apply_mask=apply_mask,
-                    mask_gt_on_save=mask_gt_on_save,
                     centered_tasks=tuple(t for t in ("red",) if t in gt_arrays_main),
                     centered_patches_per_task=centered_red_patches,
                     centered_jitter=centered_jitter,
@@ -367,21 +405,16 @@ def prepare_v3(
                     neg_pos_ratio=neg_pos_ratio,
                     max_negative_if_no_positive=max_negative_if_no_positive,
                 )
-                n_saved = save_stream_patches(
-                    out_root=out_root,
-                    subject_name=subject_name,
-                    stream_name="main",
-                    selected_patches=main_selected,
-                    has_brown=("brown" in gt_arrays_main),
-                    has_red=("red" in gt_arrays_main),
-                    has_wrinkle=False,
-                    wrinkle_min_pos_ratio=wrinkle_min_pos_ratio,
-                    apply_mask=apply_mask,
-                    mask_gt_on_save=mask_gt_on_save,
-                    manifest=manifest,
+                subject_selected.extend(
+                    _annotate_stream_candidates(
+                        main_selected,
+                        stream_name="main",
+                        has_brown=("brown" in gt_arrays_main),
+                        has_red=("red" in gt_arrays_main),
+                        has_wrinkle=False,
+                    )
                 )
-                saved_this_subject += n_saved
-                print(f"  main stream: saved={n_saved}")
+                print(f"  main stream: selected={len(main_selected)}")
             else:
                 print("  main stream: skip")
 
@@ -412,7 +445,6 @@ def prepare_v3(
                     stride=stride,
                     min_mask_coverage=min_mask_coverage,
                     apply_mask=apply_mask,
-                    mask_gt_on_save=mask_gt_on_save,
                     centered_tasks=("wrinkle",),
                     centered_patches_per_task=centered_wrinkle_patches,
                     centered_jitter=centered_jitter,
@@ -425,23 +457,48 @@ def prepare_v3(
                     neg_pos_ratio=wrinkle_neg_pos_ratio,
                     max_negative_if_no_positive=max_wrinkle_negative_if_no_positive,
                 )
+                subject_selected.extend(
+                    _annotate_stream_candidates(
+                        wrinkle_selected,
+                        stream_name="wrinkle",
+                        has_brown=False,
+                        has_red=False,
+                        has_wrinkle=True,
+                    )
+                )
+                print(f"  wrinkle stream: selected={len(wrinkle_selected)}")
+            else:
+                print("  wrinkle stream: skip")
+
+            if max_patches_per_subject and max_patches_per_subject > 0:
+                if len(subject_selected) > max_patches_per_subject:
+                    subject_selected = sorted(
+                        subject_selected,
+                        key=_combined_patch_quality,
+                        reverse=True,
+                    )[:max_patches_per_subject]
+                    print(f"  subject cap applied: kept={len(subject_selected)}")
+
+            by_stream: dict[str, list[dict]] = {"main": [], "wrinkle": []}
+            for patch in subject_selected:
+                by_stream[patch["_stream_name"]].append(patch)
+
+            for stream_name, patches in by_stream.items():
+                if not patches:
+                    continue
                 n_saved = save_stream_patches(
                     out_root=out_root,
                     subject_name=subject_name,
-                    stream_name="wrinkle",
-                    selected_patches=wrinkle_selected,
-                    has_brown=False,
-                    has_red=False,
-                    has_wrinkle=True,
+                    stream_name=stream_name,
+                    selected_patches=patches,
+                    has_brown=bool(patches[0]["_has_brown"]),
+                    has_red=bool(patches[0]["_has_red"]),
+                    has_wrinkle=bool(patches[0]["_has_wrinkle"]),
                     wrinkle_min_pos_ratio=wrinkle_min_pos_ratio,
                     apply_mask=apply_mask,
-                    mask_gt_on_save=mask_gt_on_save,
                     manifest=manifest,
                 )
                 saved_this_subject += n_saved
-                print(f"  wrinkle stream: saved={n_saved}")
-            else:
-                print("  wrinkle stream: skip")
 
             if saved_this_subject == 0:
                 skipped.append(subject_name)
@@ -475,7 +532,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stride", type=int, default=256)
     parser.add_argument("--min_mask_coverage", type=float, default=0.7)
     parser.add_argument("--no_apply_mask", action="store_true")
-    parser.add_argument("--no_mask_gt_on_save", action="store_true")
     parser.add_argument("--neg_pos_ratio", type=float, default=2.0)
     parser.add_argument("--max_negative_if_no_positive", type=int, default=0)
     parser.add_argument("--wrinkle_min_pos_ratio", type=float, default=1e-5)
@@ -486,6 +542,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--centered_jitter", type=int, default=64)
     parser.add_argument("--centered_min_mask_coverage", type=float, default=0.5)
     parser.add_argument("--centered_seed", type=int, default=42)
+    parser.add_argument("--max_patches_per_subject", type=int, default=0)
     parser.add_argument("--disable_mediapipe", action="store_true")
     parser.add_argument("--face_landmarker_task_path", default=None)
     return parser.parse_args()
@@ -501,7 +558,6 @@ def main() -> None:
         stride=args.stride,
         min_mask_coverage=args.min_mask_coverage,
         apply_mask=not args.no_apply_mask,
-        mask_gt_on_save=not args.no_mask_gt_on_save,
         neg_pos_ratio=args.neg_pos_ratio,
         max_negative_if_no_positive=args.max_negative_if_no_positive,
         wrinkle_min_pos_ratio=args.wrinkle_min_pos_ratio,
@@ -512,6 +568,9 @@ def main() -> None:
         centered_jitter=args.centered_jitter,
         centered_min_mask_coverage=args.centered_min_mask_coverage,
         centered_seed=args.centered_seed,
+        max_patches_per_subject=(
+            args.max_patches_per_subject if args.max_patches_per_subject > 0 else None
+        ),
         disable_mediapipe=args.disable_mediapipe,
         face_landmarker_task_path=args.face_landmarker_task_path,
     )
