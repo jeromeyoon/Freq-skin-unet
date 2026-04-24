@@ -83,22 +83,24 @@ CFG = dict(
     gradient_prob=0.5,
 
     use_weighted_sampler=True,
-    sampler_neg_weight=0.02,
+    sampler_neg_weight=0.10,
     prefetch_factor=4,
     consistency_every_n_steps=2,
 
     red_area_weight=0.20,
-    red_outside_weight=0.12,
+    red_outside_weight=0.30,
 
     # ── Wrinkle loss (Tversky + Focal + Edge) ─────────────────────────────
     # Tversky: alpha=FP weight, beta=FN weight.
     # beta > alpha → miss no wrinkle line (tolerate false positives).
     wrinkle_tversky_alpha=0.3,
     wrinkle_tversky_beta=0.7,
-    # Focal BCE: high gamma suppresses easy background, high alpha boosts
-    # the rare positive pixels (deep wrinkle lines are <1% of face area).
+    # Focal BCE: high gamma suppresses easy background, alpha balances
+    # positive/negative pixel gradient budget for sparse wrinkle lines.
+    # alpha=0.80: negatives contribute 20% of gradient (vs 3% at 0.97),
+    # preventing "predict positive everywhere" collapse.
     wrinkle_focal_gamma=3.0,
-    wrinkle_focal_alpha=0.97,
+    wrinkle_focal_alpha=0.80,
     # Sobel edge agreement: encourages precise wrinkle boundary placement.
     wrinkle_edge_weight=0.15,
     # GT soft-label dilation (pixels).  VISIA wrinkle GT is often annotated
