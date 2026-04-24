@@ -228,7 +228,13 @@ class SkinAnalyzerV2(nn.Module):
         super().__init__()
 
         self.cross_encoder    = CrossPolEncoderV2(base_ch, low_r, high_r)
-        self.hue_branch       = HueBranch(base_ch)
+        # Separate HueBranch per task: brown(R>G>B) and red(R>>G≈B) have
+        # distinct chromaticity patterns.  A shared branch receives opposing
+        # gradients from brown and red steps under task-sampled training,
+        # which slows red convergence.  Independent branches eliminate this
+        # interference at the cost of ~2.4 M extra parameters (base_ch=64).
+        self.hue_branch_brown = HueBranch(base_ch)
+        self.hue_branch_red   = HueBranch(base_ch)
         self.parallel_encoder = ParallelPolEncoder(base_ch, low_r, high_r)
 
         self.brown_head   = SpotHeadV2(base_ch)
@@ -241,14 +247,15 @@ class SkinAnalyzerV2(nn.Module):
                 skin_mask:    torch.Tensor | None = None) -> SkinResult:
 
         cross_out    = self.cross_encoder(rgb_cross)
-        hue_feats    = self.hue_branch(rgb_cross)
+        hue_brown    = self.hue_branch_brown(rgb_cross)
+        hue_red      = self.hue_branch_red(rgb_cross)
         parallel_out = self.parallel_encoder(rgb_parallel)
 
         brown_mask,   brown_score   = self.brown_head(
-            cross_out.chroma, hue_feats, cross_out.bottleneck, skin_mask)
+            cross_out.chroma, hue_brown, cross_out.bottleneck, skin_mask)
 
         red_mask,     red_score     = self.red_head(
-            cross_out.chroma, hue_feats, cross_out.bottleneck, skin_mask)
+            cross_out.chroma, hue_red, cross_out.bottleneck, skin_mask)
 
         wrinkle_mask, wrinkle_score = self.wrinkle_head(
             parallel_out.texture, parallel_out.bottleneck, skin_mask)

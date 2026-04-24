@@ -130,14 +130,48 @@ class SpotHead(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ChannelAttention (Squeeze-and-Excitation)
+# ══════════════════════════════════════════════════════════════════════════════
+class ChannelAttention(nn.Module):
+    """Squeeze-and-excitation channel attention.
+
+    Skin-expert rationale: when multi-scale texture features are concatenated,
+    different channels carry different frequency bands (fine grain vs coarse
+    groove structure).  SE attention lets the model learn which channel mix
+    best represents deep wrinkle grooves vs background skin texture, without
+    increasing spatial resolution cost.
+    """
+
+    def __init__(self, channels: int, reduction: int = 8):
+        super().__init__()
+        hidden = max(channels // reduction, 4)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, _, _ = x.shape
+        w = self.pool(x).view(b, c)
+        w = self.fc(w).view(b, c, 1, 1)
+        return x * w
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # WrinkleHead
 # ══════════════════════════════════════════════════════════════════════════════
 class WrinkleHead(nn.Module):
     """
-    주름 예측
+    주름 예측 — UpBlock 기반 계층적 U-Net decoder
 
-    고주파 텍스처 feature를 multi-scale로 concat 후 예측.
-    bottleneck을 통해 global context 반영.
+    고주파 텍스처 feature를 U-Net 방식으로 단계별 decode.
+    이전 flat-concat + bilinear upsample 대비:
+      - ConvTranspose2d로 업샘플 → 고주파 텍스처 정보 보존
+      - 각 scale에서 skip feature와 결합 → 공간 정밀도 유지
+      - Channel attention을 final feature에 적용해 wrinkle-band 선택
 
     입력
     ----
@@ -158,22 +192,15 @@ class WrinkleHead(nn.Module):
         super().__init__()
         ch = base_ch
 
-        # bottleneck → t3 해상도로 업샘플 후 t3와 concat
-        self.up_bottleneck = nn.Sequential(
-            nn.ConvTranspose2d(ch * 8, ch * 4, kernel_size=2, stride=2),
-            nn.BatchNorm2d(ch * 4),
-            nn.ReLU(inplace=True),
-        )
+        # Hierarchical decoder: bottleneck → t3 → t2 → t1 (SpotHeadV2와 동일 구조)
+        self.up3 = UpBlock(ch * 8, ch * 4, ch * 4)   # bottleneck + t3 → d3
+        self.up2 = UpBlock(ch * 4, ch * 2, ch * 2)   # d3 + t2 → d2
+        self.up1 = UpBlock(ch * 2, ch,     ch)        # d2 + t1 → d1
 
-        # bottleneck_up + t3 → ch*4
-        self.merge_bot = ConvBlock(ch * 4 + ch * 4, ch * 4)
+        # Channel attention selects which frequency bands carry wrinkle signal.
+        self.channel_att = ChannelAttention(ch)
 
-        fused_ch = ch + ch * 2 + ch * 4   # t1 + t2_up + merged_t3
-
-        self.fuse = nn.Sequential(
-            nn.Conv2d(fused_ch, ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(ch),
-            nn.ReLU(inplace=True),
+        self.head = nn.Sequential(
             nn.Conv2d(ch, ch // 2, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(ch // 2),
             nn.ReLU(inplace=True),
@@ -186,22 +213,12 @@ class WrinkleHead(nn.Module):
                 skin_mask: torch.Tensor | None = None):
         t1, t2, t3 = texture_feats   # fine → coarse
 
-        # bottleneck → t3 해상도로 업샘플 후 merge
-        bot_up = self.up_bottleneck(bottleneck)   # [B, ch*4, H/4, H/4]
-        if bot_up.shape != t3.shape:
-            bot_up = F.interpolate(bot_up, size=t3.shape[2:],
-                                   mode='bilinear', align_corners=False)
-        t3_merged = self.merge_bot(torch.cat([bot_up, t3], dim=1))  # [B, ch*4, H/4, H/4]
+        d3 = self.up3(bottleneck, t3)   # [B, ch*4, H/4, H/4]
+        d2 = self.up2(d3,         t2)   # [B, ch*2, H/2, H/2]
+        d1 = self.up1(d2,         t1)   # [B, ch,   H,   W]
 
-        # 모든 레벨을 t1 해상도로 업샘플 후 concat
-        target_h, target_w = t1.shape[2], t1.shape[3]
-        t2_up     = F.interpolate(t2,        size=(target_h, target_w),
-                                  mode='bilinear', align_corners=False)
-        t3_up     = F.interpolate(t3_merged, size=(target_h, target_w),
-                                  mode='bilinear', align_corners=False)
-
-        fused = torch.cat([t1, t2_up, t3_up], dim=1)   # [B, fused_ch, H, W]
-        logit = self.fuse(fused)                           # [B, 1, H, W]  raw logit
+        d1 = self.channel_att(d1)       # SE attention: wrinkle-band selection
+        logit = self.head(d1)           # [B, 1, H, W]  raw logit
         prob  = torch.sigmoid(logit)
-        score = _compute_score(prob, skin_mask)            # [B]
+        score = _compute_score(prob, skin_mask)   # [B]
         return logit, score
