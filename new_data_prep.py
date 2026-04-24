@@ -387,6 +387,7 @@ def process_subject(
     stride: int,
     min_mask_coverage: float,
     apply_mask: bool,
+    mask_gt_on_save: bool,
     neg_pos_ratio: float,
     max_negative_if_no_positive: int,
     wrinkle_min_pos_ratio: float,
@@ -501,10 +502,12 @@ def process_subject(
                 gt_patch_for_ratio = (
                     apply_mask_to_gray(gt_patch, m_p) if apply_mask else gt_patch
                 )
-                # Save raw GT crop so patch GT remains visually comparable with
-                # the original annotation. The training loss still applies
-                # face_mask, and sampling ratios are computed on the masked ROI.
-                gt_patch_map[task] = gt_patch
+                gt_patch_save = (
+                    apply_mask_to_gray(gt_patch, m_p)
+                    if (apply_mask and mask_gt_on_save)
+                    else gt_patch
+                )
+                gt_patch_map[task] = gt_patch_save
 
                 pos_ratio = float((gt_patch_for_ratio > 127).sum()) / gt_patch_for_ratio.size
                 gt_pos_ratios[f"{task}_pos_ratio"] = round(pos_ratio, 6)
@@ -618,6 +621,7 @@ def process_subject(
             "has_red": has_gt["red"],
             "has_wrinkle": has_wrinkle_patch,
             "mask_applied": apply_mask,
+            "gt_mask_applied": bool(apply_mask and mask_gt_on_save),
             "is_positive": patch["is_positive"],
             "is_wrinkle_positive": has_wrinkle_patch,
             "is_wrinkle_negative": has_gt["wrinkle"] and not has_wrinkle_patch,
@@ -917,6 +921,7 @@ def prepare(
     stride: int = 256,
     min_mask_coverage: float = 0.7,
     apply_mask: bool = True,
+    mask_gt_on_save: bool = False,
     neg_pos_ratio: float = 2.0,
     max_negative_if_no_positive: int = 0,
     wrinkle_min_pos_ratio: float = 1e-5,
@@ -974,6 +979,7 @@ def prepare(
         stride=stride,
         min_mask_coverage=min_mask_coverage,
         apply_mask=apply_mask,
+        mask_gt_on_save=mask_gt_on_save,
         neg_pos_ratio=neg_pos_ratio,
         max_negative_if_no_positive=max_negative_if_no_positive,
         wrinkle_min_pos_ratio=wrinkle_min_pos_ratio,
@@ -1094,6 +1100,11 @@ if __name__ == "__main__":
         help="저장 시 RGB/GT에 얼굴 마스크를 적용하지 않음",
     )
     parser.add_argument(
+        "--mask_gt_on_save",
+        action="store_true",
+        help="GT patch 저장 시에도 얼굴 마스크를 적용함 (기본: raw GT 저장)",
+    )
+    parser.add_argument(
         "--neg_pos_ratio",
         type=float,
         default=2.0,
@@ -1203,6 +1214,7 @@ if __name__ == "__main__":
         stride=args.stride,
         min_mask_coverage=args.min_mask_coverage,
         apply_mask=not args.no_apply_mask,
+        mask_gt_on_save=args.mask_gt_on_save,
         neg_pos_ratio=args.neg_pos_ratio,
         max_negative_if_no_positive=args.max_negative_if_no_positive,
         wrinkle_min_pos_ratio=args.wrinkle_min_pos_ratio,

@@ -195,6 +195,7 @@ def main() -> None:
         stride=args.stride,
         min_mask_coverage=args.min_mask_coverage,
         apply_mask=not args.no_apply_mask,
+        mask_gt_on_save=True,
         neg_pos_ratio=args.neg_pos_ratio,
         max_negative_if_no_positive=args.max_negative_if_no_positive,
         wrinkle_min_pos_ratio=args.wrinkle_min_pos_ratio,
