@@ -25,7 +25,8 @@ from __future__ import annotations
 import argparse
 import json
 import threading
-from collections import defaultdict
+import datetime
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -852,38 +853,60 @@ def _score_subject(subject_name: str, gt_maps: dict) -> int:
     return score
 
 
+def _subject_gt_info(subject_name: str, gt_maps: dict) -> dict:
+    """Return GT availability flags for one subject (no image I/O)."""
+    return {
+        "has_wrinkle":  find_matching_gt(subject_name, gt_maps["wrinkle"]) is not None,
+        "has_red_curr": _has_curr_red(subject_name, gt_maps),
+        "has_red":      find_matching_gt(subject_name, gt_maps["red"]) is not None,
+        "has_brown":    find_matching_gt(subject_name, gt_maps["brown"]) is not None,
+    }
+
+
 def _select_top_subjects(
     subject_dirs: list,
     gt_maps: dict,
     max_subjects: int,
-) -> list:
-    """Select the top-quality subjects by GT richness score."""
+) -> tuple[list, list[dict]]:
+    """
+    Select the top-quality subjects by GT richness score.
+
+    Returns
+    -------
+    selected : list of Path  — subjects to process
+    excluded_records : list of dict  — subjects not selected, with score/GT info
+    """
     scored = [
         (d, _score_subject(d.name, gt_maps))
         for d in subject_dirs
     ]
     # Stable sort: score descending, name ascending as tie-break.
     scored.sort(key=lambda t: (-t[1], t[0].name))
+
     selected = [d for d, _ in scored[:max_subjects]]
+
+    excluded_records = [
+        {"subject_name": d.name, "reason": "not_selected", "score": score,
+         **_subject_gt_info(d.name, gt_maps)}
+        for d, score in scored[max_subjects:]
+    ]
 
     n_total = len(subject_dirs)
     n_wrinkle  = sum(1 for d in selected if find_matching_gt(d.name, gt_maps["wrinkle"]) is not None)
     n_red_curr = sum(1 for d in selected if _has_curr_red(d.name, gt_maps))
     n_red      = sum(1 for d in selected if find_matching_gt(d.name, gt_maps["red"]) is not None)
     n_brown    = sum(1 for d in selected if find_matching_gt(d.name, gt_maps["brown"]) is not None)
-
-    # Score distribution of selected subjects
-    from collections import Counter
     score_dist = Counter(s for _, s in scored[:max_subjects])
     print(
-        f"[subject-select] {n_total} → {len(selected)} subjects selected\n"
+        f"[subject-select] {n_total} → {len(selected)} subjects selected "
+        f"(excluded={len(excluded_records)})\n"
         f"  wrinkle GT : {n_wrinkle}\n"
         f"  red curr   : {n_red_curr}  (specialist-corrected)\n"
         f"  red total  : {n_red}\n"
         f"  brown GT   : {n_brown}\n"
         f"  score dist : { {k: score_dist[k] for k in sorted(score_dist, reverse=True)} }"
     )
-    return selected
+    return selected, excluded_records
 
 
 def prepare(
@@ -928,10 +951,14 @@ def prepare(
     )
 
     subject_dirs = sorted([d for d in input_root.iterdir() if d.is_dir()])
-    print(f"input ID 수: {len(subject_dirs)}")
+    total_input = len(subject_dirs)
+    print(f"input ID 수: {total_input}")
 
-    if max_subjects and max_subjects > 0 and len(subject_dirs) > max_subjects:
-        subject_dirs = _select_top_subjects(subject_dirs, gt_maps, max_subjects)
+    excluded_records: list[dict] = []
+    if max_subjects and max_subjects > 0 and total_input > max_subjects:
+        subject_dirs, excluded_records = _select_top_subjects(
+            subject_dirs, gt_maps, max_subjects
+        )
 
     manifest: dict[str, dict] = {}
     total_patches = 0
@@ -1023,231 +1050,32 @@ def prepare(
         t: sum(1 for v in manifest.values() if v[f"has_{t}"])
         for t in ["brown", "red", "wrinkle"]
     }
-    print(f"  brown GT:   {stats['brown']:,} ?⑥튂")
-    print(f"  red GT:     {stats['red']:,} ?⑥튂")
-    print(f"  wrinkle GT: {stats['wrinkle']:,} ?⑥튂")
-    return
-
-    rng = np.random.default_rng(centered_seed)
-
-    mp = None
-    landmarker = None
-    if not disable_mediapipe:
-        mp, landmarker = create_face_landmarker(face_landmarker_task_path)
-
-    try:
-        for subj_dir in subject_dirs:
-            subject_name = subj_dir.name
-
-            cross_path = subj_dir / "F_10.jpg"
-            parallel_path = subj_dir / "F_11.jpg"
-
-            if not cross_path.exists() or not parallel_path.exists():
-                print(f"  [SKIP] {subject_name}: F_10.jpg / F_11.jpg 없음")
-                skipped_ids.append(subject_name)
-                continue
-
-            gt_paths = {
-                task: find_matching_gt(subject_name, gt_maps[task])
-                for task in GT_SUBDIRS
-            }
-            has_gt = {task: p is not None for task, p in gt_paths.items()}
-            matched = [t for t, h in has_gt.items() if h]
-            if matched:
-                print(f"  {subject_name}: GT={matched}")
-            else:
-                print(f"  [INFO] {subject_name}: 매칭된 GT 없음 -> 입력 only")
-
-            cross_bgr = load_rgb_bgr(cross_path)
-            h, w = cross_bgr.shape[:2]
-            parallel_bgr = load_rgb_bgr(parallel_path, target_hw=(h, w))
-
-            if disable_mediapipe:
-                face_mask = generate_face_mask_fallback_only(cross_bgr)
-            else:
-                face_mask = generate_face_mask_v2(cross_bgr, mp=mp, landmarker=landmarker)
-
-            gt_arrays = {}
-            for task, gt_p in gt_paths.items():
-                if gt_p is not None:
-                    gt_arrays[task] = load_gray(gt_p, target_hw=(h, w))
-
-            valid_positions = find_valid_positions(
-                face_mask, patch_size, stride, min_mask_coverage
-            )
-            position_set = set(valid_positions)
-            centered_counts: dict[str, int] = {}
-            for task in centered_tasks:
-                if task not in gt_arrays:
-                    centered_counts[task] = 0
-                    continue
-                extra_positions = generate_task_centered_positions(
-                    gt_array=gt_arrays[task],
-                    face_mask=face_mask,
-                    patch_size=patch_size,
-                    max_patches=centered_patches_per_task,
-                    jitter=centered_jitter,
-                    min_mask_coverage=centered_min_mask_coverage,
-                    rng=rng,
-                )
-                added = 0
-                for pos in extra_positions:
-                    if pos not in position_set:
-                        valid_positions.append(pos)
-                        position_set.add(pos)
-                        added += 1
-                centered_counts[task] = added
-
-            patch_candidates = []
-            for y, x in valid_positions:
-                c_p = crop_patch(cross_bgr, y, x, patch_size)
-                p_p = crop_patch(parallel_bgr, y, x, patch_size)
-                m_p = crop_patch(face_mask, y, x, patch_size)
-
-                if apply_mask:
-                    c_p = apply_mask_to_rgb(c_p, m_p)
-                    p_p = apply_mask_to_rgb(p_p, m_p)
-
-                gt_pos_ratios = {}
-                task_positive = {}
-                is_positive = False
-                gt_patch_map = {}
-                for task in ["brown", "red", "wrinkle"]:
-                    if task in gt_arrays:
-                        gt_patch = crop_patch(gt_arrays[task], y, x, patch_size)
-                        if apply_mask:
-                            gt_patch = apply_mask_to_gray(gt_patch, m_p)
-                        gt_patch_map[task] = gt_patch
-
-                        pos_ratio = float((gt_patch > 127).sum()) / gt_patch.size
-                        gt_pos_ratios[f"{task}_pos_ratio"] = round(pos_ratio, 6)
-                        task_positive[task] = pos_ratio > 0.0
-                        if pos_ratio > 0.0:
-                            is_positive = True
-
-                patch_candidates.append(
-                    {
-                        "y": y,
-                        "x": x,
-                        "cross": c_p,
-                        "parallel": p_p,
-                        "mask": m_p,
-                        "gt_patch_map": gt_patch_map,
-                        "gt_pos_ratios": gt_pos_ratios,
-                        "task_positive": task_positive,
-                        "is_positive": is_positive,
-                    }
-                )
-
-            positives = [p for p in patch_candidates if p["is_positive"]]
-            negatives = [p for p in patch_candidates if not p["is_positive"]]
-
-            wrinkle_positives = [
-                p for p in patch_candidates
-                if p["gt_pos_ratios"].get("wrinkle_pos_ratio", 0.0) >= wrinkle_min_pos_ratio
-            ]
-            wrinkle_negatives = [
-                p for p in patch_candidates
-                if "wrinkle" in p["gt_patch_map"]
-                and p["gt_pos_ratios"].get("wrinkle_pos_ratio", 0.0) < wrinkle_min_pos_ratio
-            ]
-
-            if positives:
-                neg_keep_count = min(
-                    len(negatives),
-                    int(np.ceil(len(positives) * neg_pos_ratio)),
-                )
-            else:
-                neg_keep_count = min(len(negatives), max_negative_if_no_positive)
-
-            neg_keep_indices = select_negative_indices(len(negatives), neg_keep_count)
-            selected_patches = positives + [
-                neg for i, neg in enumerate(negatives) if i in neg_keep_indices
-            ]
-
-            if wrinkle_positives:
-                wrinkle_neg_keep_count = min(
-                    len(wrinkle_negatives),
-                    int(np.ceil(len(wrinkle_positives) * wrinkle_neg_pos_ratio)),
-                )
-            else:
-                wrinkle_neg_keep_count = min(
-                    len(wrinkle_negatives),
-                    max_wrinkle_negative_if_no_positive,
-                )
-
-            wrinkle_neg_keep_indices = select_negative_indices(
-                len(wrinkle_negatives),
-                wrinkle_neg_keep_count,
-            )
-            selected_ids = {id(p) for p in selected_patches}
-            for p in wrinkle_positives:
-                if id(p) not in selected_ids:
-                    selected_patches.append(p)
-                    selected_ids.add(id(p))
-            for i, p in enumerate(wrinkle_negatives):
-                if i in wrinkle_neg_keep_indices and id(p) not in selected_ids:
-                    selected_patches.append(p)
-                    selected_ids.add(id(p))
-
-            saved = 0
-            for idx, patch in enumerate(selected_patches):
-                y = patch["y"]
-                x = patch["x"]
-                stem = f"{subject_name}_{idx:04d}"
-
-                bgr2rgb_pil(patch["cross"]).save(out_root / "rgb_cross" / f"{stem}.png")
-                bgr2rgb_pil(patch["parallel"]).save(out_root / "rgb_parallel" / f"{stem}.png")
-                Image.fromarray(patch["mask"], mode="L").save(out_root / "mask" / f"{stem}.png")
-
-                for task, gt_patch in patch["gt_patch_map"].items():
-                    Image.fromarray(gt_patch, mode="L").save(out_root / task / f"{stem}.png")
-
-                wrinkle_pos_ratio = patch["gt_pos_ratios"].get("wrinkle_pos_ratio", 0.0)
-                has_wrinkle_patch = has_gt["wrinkle"] and wrinkle_pos_ratio >= wrinkle_min_pos_ratio
-
-                manifest[stem] = {
-                    "subject_name": subject_name,
-                    "patch_idx": idx,
-                    "patch_pos": [y, x],
-                    "has_brown": has_gt["brown"],
-                    "has_red": has_gt["red"],
-                    "has_wrinkle": has_wrinkle_patch,
-                    "mask_applied": apply_mask,
-                    "is_positive": patch["is_positive"],
-                    "is_wrinkle_positive": has_wrinkle_patch,
-                    "is_wrinkle_negative": has_gt["wrinkle"] and not has_wrinkle_patch,
-                    **patch["gt_pos_ratios"],
-                }
-                saved += 1
-                total_patches += 1
-
-            print(
-                f"    -> {saved}개 패치 저장 "
-                f"(positive={len(positives)}, negative_kept={neg_keep_count}/{len(negatives)}, "
-                f"centered={centered_counts}, "
-                f"wrinkle_pos={len(wrinkle_positives)}, "
-                f"wrinkle_neg_kept={wrinkle_neg_keep_count}/{len(wrinkle_negatives)})"
-            )
-    finally:
-        if landmarker is not None:
-            landmarker.close()
-
-    manifest_path = out_root / "manifest.json"
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, ensure_ascii=False)
-
-    print(f"\n완료: 총 {total_patches}개 패치 생성 -> {patch_dir}")
-    if skipped_ids:
-        print(f"원본 이미지가 없어 건너뛴 ID: {skipped_ids}")
-
-    stats = {
-        t: sum(1 for v in manifest.values() if v[f"has_{t}"])
-        for t in ["brown", "red", "wrinkle"]
-    }
     print(f"  brown GT:   {stats['brown']:,} 패치")
     print(f"  red GT:     {stats['red']:,} 패치")
     print(f"  wrinkle GT: {stats['wrinkle']:,} 패치")
+
+    for name in skipped_ids:
+        excluded_records.append({
+            "subject_name": name,
+            "reason": "no_image",
+            "score": _score_subject(name, gt_maps),
+            **_subject_gt_info(name, gt_maps),
+        })
+    excluded_records.sort(key=lambda r: (-r["score"], r["subject_name"]))
+
+    excluded_path = out_root / "excluded_subjects.json"
+    excluded_data = {
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "total_input": total_input,
+        "total_selected": total_input - len(excluded_records),
+        "total_excluded": len(excluded_records),
+        "not_selected": sum(1 for r in excluded_records if r["reason"] == "not_selected"),
+        "no_image": sum(1 for r in excluded_records if r["reason"] == "no_image"),
+        "excluded": excluded_records,
+    }
+    with open(excluded_path, "w", encoding="utf-8") as f:
+        json.dump(excluded_data, f, indent=2, ensure_ascii=False)
+    print(f"[excluded] {len(excluded_records)}개 subject → {excluded_path}")
 
 
 if __name__ == "__main__":
@@ -1342,6 +1170,12 @@ if __name__ == "__main__":
         help="ID 단위 병렬 처리 worker 수 (기본 1, 예: 4)",
     )
     parser.add_argument(
+        "--max_subjects",
+        type=int,
+        default=0,
+        help="GT 풍부도 기준 상위 N개 subject만 선택 (0 이하면 전체 사용)",
+    )
+    parser.add_argument(
         "--max_total_patches",
         type=int,
         default=2000,
@@ -1384,7 +1218,8 @@ if __name__ == "__main__":
         disable_mediapipe=args.disable_mediapipe,
         face_landmarker_task_path=args.face_landmarker_task_path,
         num_workers=args.num_workers,
-        max_total_patches=args.max_total_patches,
-        max_patches_per_subject=args.max_patches_per_subject,
+        max_subjects=args.max_subjects if args.max_subjects > 0 else None,
+        max_total_patches=args.max_total_patches if args.max_total_patches > 0 else None,
+        max_patches_per_subject=args.max_patches_per_subject if args.max_patches_per_subject > 0 else None,
         patch_dedup_iou=args.patch_dedup_iou,
     )
