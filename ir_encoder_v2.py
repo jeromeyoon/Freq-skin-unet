@@ -74,8 +74,9 @@ class ODFrequencyFilter(nn.Module):
         super().__init__()
         self.low_r  = low_r
         self.high_r = high_r
-        # R, G, B 채널별 독립 억제 강도 (초기: sigmoid(-3) ≈ 0.047)
-        self.low_logit = nn.Parameter(torch.full((1, 3, 1, 1), -3.0))
+        # R, G, B 채널별 독립 억제 강도 (초기: sigmoid(-1) ≈ 0.27)
+        # -3(≈0.05)에서 -1(≈0.27)로 올려 초기부터 조명 제거 동작
+        self.low_logit = nn.Parameter(torch.full((1, 3, 1, 1), -1.0))
 
     def _radial_mask(self, H: int, W: int,
                      r_lo: float, r_hi: float,
@@ -88,17 +89,29 @@ class ODFrequencyFilter(nn.Module):
 
     def forward(self, od: torch.Tensor) -> torch.Tensor:
         B, C, H, W = od.shape
-        F_shift = torch.fft.fftshift(torch.fft.fft2(od))
+        compute_dtype = od.dtype
 
-        low_mask = self._radial_mask(H, W, 0.0,        self.low_r,  od.device)
-        mid_mask = self._radial_mask(H, W, self.low_r, self.high_r, od.device)
+        # AMP 환경에서 complex half 오류 및 NaN 방지 — float32 강제
+        if od.is_cuda:
+            with torch.cuda.amp.autocast(enabled=False):
+                od_fp32 = od.float()
+                F_shift = torch.fft.fftshift(torch.fft.fft2(od_fp32))
+                low_mask = self._radial_mask(H, W, 0.0, self.low_r, od.device)
+                mid_mask = self._radial_mask(H, W, self.low_r, self.high_r, od.device)
+                od_low = torch.fft.ifft2(torch.fft.ifftshift(F_shift * low_mask)).real
+                od_mid = torch.fft.ifft2(torch.fft.ifftshift(F_shift * mid_mask)).real
+                gate_low = torch.sigmoid(self.low_logit).float()
+                od_chroma = od_mid - gate_low * od_low
+        else:
+            F_shift = torch.fft.fftshift(torch.fft.fft2(od))
+            low_mask = self._radial_mask(H, W, 0.0, self.low_r, od.device)
+            mid_mask = self._radial_mask(H, W, self.low_r, self.high_r, od.device)
+            od_low = torch.fft.ifft2(torch.fft.ifftshift(F_shift * low_mask)).real
+            od_mid = torch.fft.ifft2(torch.fft.ifftshift(F_shift * mid_mask)).real
+            gate_low = torch.sigmoid(self.low_logit)
+            od_chroma = od_mid - gate_low * od_low
 
-        od_low = torch.fft.ifft2(torch.fft.ifftshift(F_shift * low_mask)).real
-        od_mid = torch.fft.ifft2(torch.fft.ifftshift(F_shift * mid_mask)).real
-
-        gate_low  = torch.sigmoid(self.low_logit)      # (1, 3, 1, 1)
-        od_chroma = od_mid - gate_low * od_low          # Beer-Lambert 조명 제거
-        return od_chroma
+        return od_chroma.to(dtype=compute_dtype)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
