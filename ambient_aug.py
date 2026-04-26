@@ -1,118 +1,133 @@
 """
 ambient_aug.py
 ==============
-조명 변형 Augmentation — 실내 환경 특화
+조명 변형 Augmentation — 매장 천장 조명 특화
 
-배포 환경: 실내 (천장 조명, 창문, 스탠드 등)
+배포 환경 가정
+--------------
+- 매장 천장 조명 (형광등 / LED)
+- 기기 자체 LED 광원이 주광원 → 주변광은 부가 오염 수준
+- 비네팅, 스탠드, 창문 패턴은 고려하지 않음
 
 시뮬레이션 패턴
 ---------------
-1. Intensity change      : 전체 밝기 균일 스케일
-2. Color temperature     : 채널별 독립 배율 (백열 warm ↔ 형광 cool)
-3. Tint shift            : R/B 채널 편향
-4. Vignetting            : 원형 국소 조명 (스탠드, 국소 광원)
-5. Directional gradient  : 위→아래 선형 그라데이션 (천장 조명/창문) ← 실내 핵심 추가
+1. Intensity change      : 전체 밝기 균일 스케일 (기기 LED 강도 변동)
+2. Color temperature     : 채널별 배율 — 천장 형광등(cool) vs LED(warm) 차이
+3. Additive ambient fog  : 편광 차단 후 남은 천장 조명 leakage (물리적 오염)
+4. Ceiling gradient      : 위→아래 방향 부드러운 기울기 (천장 조명 위치)
 
-순수 PyTorch 구현: CPU/numpy 왕복 없이 GPU에서 전부 처리
+제거된 패턴
+-----------
+- Vignetting (비네팅): 매장 환경에서 해당 없음
+- Tint shift (R/B 독립 변화): 천장 조명에서 미미함
+- Directional random tilt: 천장은 거의 정면이므로 약한 범위로 제한
 """
 
 import torch
+import torch.nn.functional as F
 
 
 # ── 공간 조명 패턴 생성 ──────────────────────────────────────────────────────
 
 
-def _make_vignette_torch(H: int, W: int, strength: float,
-                         device: torch.device) -> torch.Tensor:
-    """가우시안 vignette 마스크 [H, W] — 원형 국소 광원 시뮬레이션"""
-    cy, cx   = H / 2.0, W / 2.0
-    y        = torch.arange(H, dtype=torch.float32, device=device)
-    x        = torch.arange(W, dtype=torch.float32, device=device)
-    Y, X     = torch.meshgrid(y, x, indexing='ij')
-    dist     = torch.sqrt((Y - cy) ** 2 + (X - cx) ** 2)
-    sigma    = min(H, W) / (2.0 * strength)
-    mask     = torch.exp(-dist ** 2 / (2 * sigma ** 2))
-    vignette = 1.0 - strength * (1.0 - mask)
-    return vignette.clamp(0.5, 1.0)                      # [H, W] — 0.1→0.5: 극단적 어두움 방지
-
-
-def _make_directional_gradient(H: int, W: int,
-                                device: torch.device) -> torch.Tensor:
+def _make_ceiling_gradient(H: int, W: int, device: torch.device) -> torch.Tensor:
     """
-    방향성 조명 그라데이션 [H, W] — 천장 조명 / 창문 광원 시뮬레이션
+    천장 조명 그라데이션 [H, W]
 
-    기본 방향: 위(밝음) → 아래(어두움)  (천장 조명의 가장 흔한 패턴)
-    tilt: 좌우 기울기를 랜덤으로 추가 → 창문이 한쪽에 있는 상황 시뮬레이션
+    천장이 위에 있으므로 위쪽이 밝고 아래쪽이 약간 어두운 패턴.
+    매장 천장은 비교적 균일 → 강도 변화 범위를 좁게 제한.
+    좌우 tilt는 천장 조명 위치 편차를 시뮬레이션 (작은 범위).
 
-    반환 범위: [0.75, 1.0] — 실내 조명은 부드러운 변화
+    반환 범위: [0.88, 1.0]
     """
-    y    = torch.linspace(1.0, 0.0, H, device=device)    # 위=1.0, 아래=0.0
-    x    = torch.linspace(-1.0, 1.0, W, device=device)
-    tilt = torch.empty(1, device=device).uniform_(-0.3, 0.3).item()
+    y = torch.linspace(1.0, 0.0, H, device=device)   # 위=1.0, 아래=0.0
+    x = torch.linspace(-1.0, 1.0, W, device=device)
+    # 천장 조명은 정면에 가까우므로 tilt를 작게 제한
+    tilt = torch.empty(1, device=device).uniform_(-0.1, 0.1).item()
     Y, X = torch.meshgrid(y, x, indexing='ij')
 
-    grad = Y + tilt * X                                   # 기울어진 그라데이션
-    # [0, 1] 정규화 후 [0.75, 1.0] 범위로 압축 (실내는 극단적 변화 없음)
+    grad = Y + tilt * X
     g_min, g_max = grad.min(), grad.max()
     grad = (grad - g_min) / (g_max - g_min + 1e-6)
-    return (0.75 + 0.25 * grad).clamp(0.6, 1.0)          # [H, W]
+    # [0.88, 1.0]: 매장 천장 조명은 부드러운 변화 (12% 이내)
+    return (0.88 + 0.12 * grad).clamp(0.85, 1.0)
+
+
+def _make_ambient_fog(
+    H: int,
+    W: int,
+    alpha: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    천장 조명 leakage 시뮬레이션 — additive ambient fog [3, H, W]
+
+    편광 시스템이 대부분의 주변광을 차단하지만 완전 차단은 불가능.
+    남은 leakage는 공간적으로 부드럽고 색온도가 일정한 패턴.
+
+    물리: I_measured = I_cross_pol + alpha * I_ambient
+    OD_measured = -log(I_cross_pol + alpha * I_ambient)  [비선형 오염]
+
+    구현: 저해상도 랜덤 텍스처 → bilinear upscale → 부드러운 fog
+    """
+    # 저해상도 ambient 패턴 (공간적으로 smooth)
+    fog_lr = torch.rand(1, 3, max(H // 16, 2), max(W // 16, 2), device=device)
+    fog = F.interpolate(fog_lr, size=(H, W), mode='bilinear', align_corners=False)
+    fog = fog.squeeze(0)  # [3, H, W]
+
+    # 천장 조명 색온도는 neutral~slightly cool → 채널 편차 작게
+    ch_tint = torch.empty(3, device=device).uniform_(0.9, 1.1)
+    fog = fog * ch_tint.view(3, 1, 1)
+
+    return (alpha * fog).clamp(0.0, 1.0)
 
 
 # ── 단일 이미지 augmentation ────────────────────────────────────────────────
 
 
-def apply_illumination_aug(rgb: torch.Tensor,
-                            intensity_range   : tuple = (0.6, 1.4),
-                            color_temp_range  : tuple = (0.7, 1.3),
-                            tint_range        : tuple = (0.8, 1.2),
-                            vignette_prob     : float = 0.5,
-                            vignette_strength : float = 0.4,
-                            gradient_prob     : float = 0.5,
-                            ) -> torch.Tensor:
+def apply_illumination_aug(
+    rgb: torch.Tensor,
+    intensity_range: tuple = (0.85, 1.15),
+    color_temp_range: tuple = (0.85, 1.15),
+    ambient_fog_alpha_range: tuple = (0.0, 0.05),
+    ceiling_gradient_prob: float = 0.5,
+) -> torch.Tensor:
     """
-    단일 이미지에 랜덤 실내 조명 변형 적용 (GPU 텐서에서 직접 처리)
+    단일 이미지에 천장 조명 기반 augmentation 적용
 
     Parameters
     ----------
-    rgb               : [3, H, W] float tensor 0~1
-    intensity_range   : 전체 밝기 배율 (실내: 0.6~1.4)
-    color_temp_range  : 색온도 배율 — 채널별 독립 (백열 warm ↔ 형광 cool)
-    tint_range        : R/B 채널 틴트 배율
-    vignette_prob     : 원형 국소 조명 적용 확률
-    vignette_strength : vignette 강도
-    gradient_prob     : 방향성 그라데이션 적용 확률 (천장/창문 조명)
+    rgb                     : [3, H, W] float 0~1
+    intensity_range         : 기기 LED 강도 변동 (±15%)
+    color_temp_range        : 천장 조명 색온도 (형광 cool ~ LED warm)
+    ambient_fog_alpha_range : 편광 차단 후 남은 leakage 비율 (0~5%)
+    ceiling_gradient_prob   : 천장 기울기 적용 확률
 
     Returns
     -------
-    rgb_aug : [3, H, W] float tensor 0~1
+    rgb_aug : [3, H, W] float 0~1
     """
     device = rgb.device
-    H, W   = rgb.shape[1], rgb.shape[2]
+    H, W = rgb.shape[1], rgb.shape[2]
 
-    # 1. 전체 밝기 변화
+    # 1. 전체 밝기 변화 (기기 LED 출력 변동)
     intensity = torch.empty(1, device=device).uniform_(*intensity_range).item()
-    rgb_aug   = rgb * intensity
+    rgb_aug = rgb * intensity
 
-    # 2. 색온도 변화 (채널별 독립 배율)
+    # 2. 색온도 변화 (천장 조명 채널별 영향 — 범위 좁게)
     ch_scales = torch.empty(3, device=device).uniform_(*color_temp_range)
-    rgb_aug   = rgb_aug * ch_scales.view(3, 1, 1)
+    rgb_aug = rgb_aug * ch_scales.view(3, 1, 1)
 
-    # 3. 틴트 변화 (R, B 채널 독립 배율)
-    tint      = torch.ones(3, device=device)
-    tint[0]   = torch.empty(1, device=device).uniform_(*tint_range).item()
-    tint[2]   = torch.empty(1, device=device).uniform_(*tint_range).item()
-    rgb_aug   = rgb_aug * tint.view(3, 1, 1)
-
-    # 4 & 5. Vignetting OR 방향성 그라데이션 — 하나만 적용 (누적 어두움 방지)
-    # 둘 다 적용되면 최악 0.5×0.6=0.30 배율로 기존 color 변형과 곱해져 이미지 파괴
-    r = torch.rand(1, device=device).item()
-    if r < vignette_prob:
-        strength = torch.empty(1, device=device).uniform_(0.1, vignette_strength).item()
-        vignette = _make_vignette_torch(H, W, strength, device)
-        rgb_aug  = rgb_aug * vignette.unsqueeze(0)
-    elif r < vignette_prob + gradient_prob:
-        grad    = _make_directional_gradient(H, W, device)
+    # 3. 천장 그라데이션 (위→아래, 작은 좌우 기울기)
+    if torch.rand(1, device=device).item() < ceiling_gradient_prob:
+        grad = _make_ceiling_gradient(H, W, device)
         rgb_aug = rgb_aug * grad.unsqueeze(0)
+
+    # 4. Additive ambient fog (편광 leakage — 물리적 오염)
+    alpha = torch.empty(1, device=device).uniform_(*ambient_fog_alpha_range).item()
+    if alpha > 1e-4:
+        fog = _make_ambient_fog(H, W, alpha, device)
+        rgb_aug = rgb_aug + fog
 
     return rgb_aug.clamp(0.0, 1.0)
 

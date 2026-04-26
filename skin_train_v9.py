@@ -44,7 +44,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, WeightedRandomSampler, random_split
 from tqdm import tqdm
 
-from ambient_aug import _make_directional_gradient, _make_vignette_torch
+from ambient_aug import _make_ceiling_gradient, _make_ambient_fog
 from skin_dataset import SkinDataset, skin_collate_fn
 from skin_loss_smooth import SkinAnalyzerLoss, get_loss_weights
 from skin_net_v2 import build_analyzer_v2
@@ -76,19 +76,18 @@ CFG = dict(
     best_w_wrinkle=1.2,
 
     aug_warmup_epochs=15,
-    intensity_range=(0.6, 1.4),
-    color_temp_range=(0.7, 1.3),
-    tint_range=(0.8, 1.2),
-    vignette_prob=0.5,
-    gradient_prob=0.5,
+    intensity_range=(0.85, 1.15),
+    color_temp_range=(0.85, 1.15),
+    ambient_fog_alpha_range=(0.0, 0.05),
+    ceiling_gradient_prob=0.5,
 
     use_weighted_sampler=True,
     sampler_neg_weight=0.10,
     prefetch_factor=4,
     consistency_every_n_steps=2,
 
-    red_area_weight=0.20,
-    red_outside_weight=0.30,
+    red_area_weight=0.10,
+    red_outside_weight=0.05,
 
     # ── Wrinkle loss (Tversky + Focal + Edge) ─────────────────────────────
     # Tversky: alpha=FP weight, beta=FN weight.
@@ -293,9 +292,10 @@ def _v2_freq_reg(model: torch.nn.Module) -> torch.Tensor:
     ODFrequencyFilter.low_logit regularization for SkinAnalyzerV2.
 
     gate_low = sigmoid(low_logit). Higher values suppress illumination more.
+    (1 - gate).mean() minimization → gate_low → 1 → 조명 제거 강화 방향
     """
     gate = torch.sigmoid(model.cross_encoder.od_filter.low_logit)
-    return gate.mean()
+    return (1.0 - gate).mean()
 
 
 @torch.no_grad()
@@ -341,48 +341,54 @@ def apply_paired_batch_illumination_aug_fast(
     rgb_cross_batch: torch.Tensor,
     rgb_parallel_batch: torch.Tensor,
     *,
-    intensity_range: tuple = (0.6, 1.4),
-    color_temp_range: tuple = (0.7, 1.3),
-    tint_range: tuple = (0.8, 1.2),
-    vignette_prob: float = 0.5,
-    vignette_strength: float = 0.4,
-    gradient_prob: float = 0.5,
+    intensity_range: tuple = (0.85, 1.15),
+    color_temp_range: tuple = (0.85, 1.15),
+    ambient_fog_alpha_range: tuple = (0.0, 0.05),
+    ceiling_gradient_prob: float = 0.5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Apply the same illumination augmentation to cross/parallel images from the
-    same sample. Scalar color transforms are vectorized across the batch.
+    Apply the same ceiling-light illumination augmentation to cross/parallel
+    images from the same sample.
+
+    천장 조명 가정:
+    - 비네팅 없음
+    - 전체 밝기 ±15%, 색온도 ±15% (형광등~LED 수준)
+    - 위→아래 방향 부드러운 gradient (천장 조명 위치)
+    - Additive ambient fog: 편광 차단 후 남은 leakage
+
+    cross/parallel에 동일한 spatial 변환 적용 → 두 이미지 간
+    상대적 관계(편광 비율)는 보존됨.
     """
-    assert rgb_cross_batch.shape == rgb_parallel_batch.shape, (
-        "rgb_cross_batch and rgb_parallel_batch must have the same shape"
-    )
+    assert rgb_cross_batch.shape == rgb_parallel_batch.shape
 
     b, _, h, w = rgb_cross_batch.shape
     device = rgb_cross_batch.device
 
+    # 1. 전체 밝기 (기기 LED 변동)
     intensity = torch.empty(b, 1, 1, 1, device=device).uniform_(*intensity_range)
+
+    # 2. 색온도 (천장 조명 채널별 영향)
     ch_scales = torch.empty(b, 3, 1, 1, device=device).uniform_(*color_temp_range)
-    tint = torch.ones(b, 3, 1, 1, device=device)
-    tint[:, 0] = torch.empty(b, 1, 1, device=device).uniform_(*tint_range)
-    tint[:, 2] = torch.empty(b, 1, 1, device=device).uniform_(*tint_range)
 
-    cross_aug = rgb_cross_batch * intensity * ch_scales * tint
-    parallel_aug = rgb_parallel_batch * intensity * ch_scales * tint
+    cross_aug = rgb_cross_batch * intensity * ch_scales
+    parallel_aug = rgb_parallel_batch * intensity * ch_scales
 
-    spatial = torch.ones(b, 1, h, w, device=device)
-    r = torch.rand(b, device=device)
-    use_vignette = r < vignette_prob
-    use_gradient = (~use_vignette) & (r < vignette_prob + gradient_prob)
+    # 3. 천장 그라데이션 (위→아래, 배치 내 독립 적용)
+    use_grad = torch.rand(b, device=device) < ceiling_gradient_prob
+    for idx in torch.where(use_grad)[0].tolist():
+        grad = _make_ceiling_gradient(h, w, device).unsqueeze(0)  # [1, H, W]
+        cross_aug[idx] = cross_aug[idx] * grad
+        parallel_aug[idx] = parallel_aug[idx] * grad
 
-    for idx in torch.where(use_vignette)[0].tolist():
-        strength = torch.empty(1, device=device).uniform_(0.1, vignette_strength).item()
-        spatial[idx, 0] = _make_vignette_torch(h, w, strength, device)
+    # 4. Additive ambient fog (편광 leakage — 동일한 fog를 양쪽에 적용)
+    fog_alphas = torch.empty(b, device=device).uniform_(*ambient_fog_alpha_range)
+    for idx, alpha in enumerate(fog_alphas.tolist()):
+        if alpha > 1e-4:
+            fog = _make_ambient_fog(h, w, alpha, device)  # [3, H, W]
+            cross_aug[idx] = cross_aug[idx] + fog
+            parallel_aug[idx] = parallel_aug[idx] + fog
 
-    for idx in torch.where(use_gradient)[0].tolist():
-        spatial[idx, 0] = _make_directional_gradient(h, w, device)
-
-    cross_aug = (cross_aug * spatial).clamp(0.0, 1.0)
-    parallel_aug = (parallel_aug * spatial).clamp(0.0, 1.0)
-    return cross_aug, parallel_aug
+    return cross_aug.clamp(0.0, 1.0), parallel_aug.clamp(0.0, 1.0)
 
 
 class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
@@ -579,12 +585,11 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         focal = alpha_t * (1.0 - p_t) ** self.wrinkle_focal_gamma * bce
         focal = focal * face_mask * avail
 
-        # Balanced denominator: weight positive and negative pixel counts by their
-        # focal alpha so the loss scale is independent of wrinkle pixel density.
-        n_pos = ((gt_m > 0.5) * face_mask * avail).sum().clamp(min=1.0)
-        n_neg = ((gt_m <= 0.5) * face_mask * avail).sum().clamp(min=1.0)
-        denom = (self.wrinkle_focal_alpha * n_pos
-                 + (1.0 - self.wrinkle_focal_alpha) * n_neg).clamp(min=1.0)
+        # face_mask 픽셀 수로 나눔.
+        # 기존 balanced denominator(alpha*n_pos + (1-alpha)*n_neg)는 1% wrinkle
+        # 밀도에서 denom ≈ 0.20*n_neg로 커져 focal이 tversky 대비 ~100배 작아짐.
+        # face_mask 기반 분모로 통일해 tversky와 유사한 loss 규모 유지.
+        denom = (face_mask * avail).sum().clamp(min=1.0)
         return focal.sum() / denom
 
     def _wrinkle_edge_loss(self, pred, gt, face_mask, has_gt) -> torch.Tensor:
@@ -713,10 +718,21 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
             loss = loss + self.w_wrinkle * l_wrinkle
 
         # Recon is brown/red chemistry-driven, so skip it on wrinkle-only steps.
+        # Task isolation: active_task='red' 스텝에서 brown_mask gradient 차단,
+        # active_task='brown' 스텝에서 red_mask gradient 차단.
         if self.w_recon > 0 and (active_task is None or active_task in ('brown', 'red')):
+            if active_task == 'red':
+                brown_for_recon = result.brown_mask.detach()
+                red_for_recon = result.red_mask
+            elif active_task == 'brown':
+                brown_for_recon = result.brown_mask
+                red_for_recon = result.red_mask.detach()
+            else:
+                brown_for_recon = result.brown_mask
+                red_for_recon = result.red_mask
             l_recon = self._beer_lambert_recon(
-                result.brown_mask,
-                result.red_mask,
+                brown_for_recon,
+                red_for_recon,
                 rgb_cross,
                 face_mask,
                 has_brown,
@@ -807,9 +823,10 @@ def train_one_epoch_task_sampled(
     aug_kwargs = dict(
         intensity_range=_scale_range(cfg['intensity_range'], aug_scale),
         color_temp_range=_scale_range(cfg['color_temp_range'], aug_scale),
-        tint_range=_scale_range(cfg['tint_range'], aug_scale),
-        vignette_prob=cfg['vignette_prob'] * aug_scale,
-        gradient_prob=cfg['gradient_prob'] * aug_scale,
+        ambient_fog_alpha_range=_scale_range(
+            cfg.get('ambient_fog_alpha_range', (0.0, 0.05)), aug_scale
+        ),
+        ceiling_gradient_prob=cfg.get('ceiling_gradient_prob', 0.5) * aug_scale,
     )
 
     amp_enabled = device.type == 'cuda'
@@ -1193,15 +1210,15 @@ def main():
             epoch / tversky_ramp, 1.0
         )
 
-        # Wrinkle-solo warmup: suppress brown/red loss for the first N epochs so
-        # the wrinkle head receives undiluted gradient before competing tasks
-        # dominate the shared encoder.
+        # Wrinkle-solo warmup: wrinkle head에 집중하되 red를 완전 동결하지 않음.
+        # red head가 8 epoch 동안 random init 상태로 방치되면 epoch 9에서
+        # 급격한 gradient spike가 발생하므로 최소한의 학습(w_red=0.15)을 유지.
         in_solo = 0 < epoch <= solo_epochs
         if in_solo:
             criterion.w_brown = 0.0
-            criterion.w_red = 0.0
+            criterion.w_red = 0.15
             criterion.w_recon = 0.0
-            epoch_cfg = {**CFG, 'task_probs': {'brown': 0.0, 'red': 0.0, 'wrinkle': 1.0}}
+            epoch_cfg = {**CFG, 'task_probs': {'brown': 0.0, 'red': 0.20, 'wrinkle': 0.80}}
         else:
             epoch_cfg = CFG
 

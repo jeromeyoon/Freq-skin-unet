@@ -164,7 +164,7 @@ class ParallelPolEncoder(nn.Module):
 
     def __init__(self, base_ch: int = 64,
                  low_r:   float = 0.1,
-                 high_r:  float = 0.4):
+                 high_r:  float = 0.12):
         super().__init__()
         ch = base_ch
 
@@ -178,6 +178,8 @@ class ParallelPolEncoder(nn.Module):
         self.enc4 = ConvBlock(ch*4, ch * 8)   # bottleneck
 
         # High-freq gate (3 levels)
+        # high_r=0.12: deep wrinkle 홈(10~30px 폭)의 에너지는 r<0.12 중주파에 집중.
+        # 기존 0.4는 ~6px 이하 초고주파만 통과 → wrinkle 신호 제거.
         self.hgate1 = HighFreqGate(ch,   low_r, high_r)
         self.hgate2 = HighFreqGate(ch*2, low_r, high_r)
         self.hgate3 = HighFreqGate(ch*4, low_r, high_r)
