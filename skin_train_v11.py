@@ -586,11 +586,13 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         has_brown,
         has_red,
         has_wrinkle,
+        wrinkle_face_mask=None,
         result_aug=None,
         model=None,
         active_task: str | None = None,
     ):
         detail = {'active_task': active_task or 'all'}
+        wf_mask = wrinkle_face_mask if wrinkle_face_mask is not None else face_mask
 
         l_brown = self._focal_dice_spot(
             result.brown_mask, brown_gt, face_mask, has_brown, alpha=0.5
@@ -611,10 +613,10 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         # Tversky(beta=0.7) was the cause of region blobs (FN-avoidance over-predicts).
         # CLDice had zero gradient for 3px GT (5-iteration skeleton collapses to 0).
         l_wrinkle_dice = self._dice_loss(
-            result.wrinkle_mask, wrinkle_gt_soft, face_mask, has_wrinkle
+            result.wrinkle_mask, wrinkle_gt_soft, wf_mask, has_wrinkle
         )
         l_wrinkle_focal = self._wrinkle_focal_bce(
-            result.wrinkle_mask, wrinkle_gt_soft, face_mask, has_wrinkle
+            result.wrinkle_mask, wrinkle_gt_soft, wf_mask, has_wrinkle
         )
         l_wrinkle = 0.70 * l_wrinkle_dice + 0.30 * l_wrinkle_focal
 
@@ -773,6 +775,7 @@ def train_one_epoch_task_sampled(
         red_gt = batch['red'].to(device, non_blocking=True)
         wrinkle_gt = batch['wrinkle'].to(device, non_blocking=True)
         mask = batch['mask'].to(device, non_blocking=True)
+        wrinkle_mask = batch['wrinkle_mask'].to(device, non_blocking=True)
 
         has_brown = batch['has_brown']
         has_red = batch['has_red']
@@ -809,6 +812,7 @@ def train_one_epoch_task_sampled(
             wrinkle_gt.float(),
             rgb_cross=rgb_cross.float(),
             face_mask=mask.float(),
+            wrinkle_face_mask=wrinkle_mask.float(),
             has_brown=has_brown,
             has_red=has_red,
             has_wrinkle=has_wrinkle,
@@ -876,6 +880,7 @@ def validate_fast(model, loader, criterion, device, cfg):
         red_gt = batch['red'].to(device, non_blocking=True)
         wrinkle_gt = batch['wrinkle'].to(device, non_blocking=True)
         mask = batch['mask'].to(device, non_blocking=True)
+        wrinkle_mask = batch['wrinkle_mask'].to(device, non_blocking=True)
 
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             result = model(rgb_cross, rgb_parallel, mask)
@@ -888,6 +893,7 @@ def validate_fast(model, loader, criterion, device, cfg):
             wrinkle_gt.float(),
             rgb_cross=rgb_cross.float(),
             face_mask=mask.float(),
+            wrinkle_face_mask=wrinkle_mask.float(),
             has_brown=batch['has_brown'],
             has_red=batch['has_red'],
             has_wrinkle=batch['has_wrinkle'],

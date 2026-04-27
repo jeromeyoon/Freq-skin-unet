@@ -717,11 +717,14 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         has_brown,
         has_red,
         has_wrinkle,
+        wrinkle_face_mask=None,
         result_aug=None,
         model=None,
         active_task: str | None = None,
     ):
         detail = {'active_task': active_task or 'all'}
+        # wrinkle 전용 mask가 없으면 일반 face_mask 사용
+        wf_mask = wrinkle_face_mask if wrinkle_face_mask is not None else face_mask
 
         l_brown = self._focal_dice_spot(
             result.brown_mask, brown_gt, face_mask, has_brown, alpha=0.5
@@ -756,15 +759,15 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         wrinkle_gt_soft = self._dilate_gt(wrinkle_gt)
 
         l_wrinkle_tversky = self._tversky_loss(
-            result.wrinkle_mask, wrinkle_gt_soft, face_mask, has_wrinkle
+            result.wrinkle_mask, wrinkle_gt_soft, wf_mask, has_wrinkle
         )
         l_wrinkle_focal = self._wrinkle_focal_bce(
-            result.wrinkle_mask, wrinkle_gt_soft, face_mask, has_wrinkle
+            result.wrinkle_mask, wrinkle_gt_soft, wf_mask, has_wrinkle
         )
         # CLDice: topology-preserving loss that penalises blob predictions.
         # Uses soft GT so the skeleton computation has a continuous input.
         l_wrinkle_cldice = _cl_dice_loss(
-            result.wrinkle_mask, wrinkle_gt_soft, face_mask, has_wrinkle,
+            result.wrinkle_mask, wrinkle_gt_soft, wf_mask, has_wrinkle,
             num_iter=self.wrinkle_cldice_iter,
         )
         # Weights: Tversky(recall) + CLDice(topology) dominate; Focal handles
@@ -932,6 +935,7 @@ def train_one_epoch_task_sampled(
         red_gt = batch['red'].to(device, non_blocking=True)
         wrinkle_gt = batch['wrinkle'].to(device, non_blocking=True)
         mask = batch['mask'].to(device, non_blocking=True)
+        wrinkle_mask = batch['wrinkle_mask'].to(device, non_blocking=True)
 
         has_brown = batch['has_brown']
         has_red = batch['has_red']
@@ -968,6 +972,7 @@ def train_one_epoch_task_sampled(
             wrinkle_gt.float(),
             rgb_cross=rgb_cross.float(),
             face_mask=mask.float(),
+            wrinkle_face_mask=wrinkle_mask.float(),
             has_brown=has_brown,
             has_red=has_red,
             has_wrinkle=has_wrinkle,
@@ -1035,6 +1040,7 @@ def validate_fast(model, loader, criterion, device, cfg):
         red_gt = batch['red'].to(device, non_blocking=True)
         wrinkle_gt = batch['wrinkle'].to(device, non_blocking=True)
         mask = batch['mask'].to(device, non_blocking=True)
+        wrinkle_mask = batch['wrinkle_mask'].to(device, non_blocking=True)
 
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             result = model(rgb_cross, rgb_parallel, mask)
@@ -1047,6 +1053,7 @@ def validate_fast(model, loader, criterion, device, cfg):
             wrinkle_gt.float(),
             rgb_cross=rgb_cross.float(),
             face_mask=mask.float(),
+            wrinkle_face_mask=wrinkle_mask.float(),
             has_brown=batch['has_brown'],
             has_red=batch['has_red'],
             has_wrinkle=batch['has_wrinkle'],

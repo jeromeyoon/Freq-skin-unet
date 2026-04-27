@@ -180,6 +180,21 @@ class SkinDataset(Dataset):
               f"양성 패치={pos}/{len(weights)}, neg_weight={neg_weight}")
         return weights
 
+    def _load_wrinkle_mask(self, stem: str, fallback: torch.Tensor) -> torch.Tensor:
+        """wrinkle 전용 face mask 로드.
+
+        mask/{subject}_wrinkle_{idx}.png 가 존재하면 해당 파일을 반환.
+        없으면 일반 face mask(fallback)를 그대로 반환.
+
+        예: stem='S001_0042'  →  mask/S001_wrinkle_0042.png 탐색
+        """
+        parts = stem.rsplit('_', 1)
+        if len(parts) == 2:
+            path = self.patch_dir / 'mask' / f"{parts[0]}_wrinkle_{parts[1]}.png"
+            if path.exists():
+                return _load_gray(path, self.img_size)
+        return fallback
+
     def _apply_augment(self, *tensors):
         """동일한 geometric augment를 모든 텐서에 적용 (None 안전)"""
         do_hflip = random.random() > 0.5
@@ -209,6 +224,9 @@ class SkinDataset(Dataset):
         mask = _load_gray(mask_path, self.img_size) if mask_path.exists() \
                else torch.ones(1, self.img_size, self.img_size)
 
+        # wrinkle 전용 face mask (없으면 일반 mask 그대로 사용)
+        wrinkle_mask = self._load_wrinkle_mask(stem, mask)
+
         # GT (부분 로드)
         def load_gt(task: str) -> torch.Tensor | None:
             if not info.get(f'has_{task}', False):
@@ -222,20 +240,21 @@ class SkinDataset(Dataset):
 
         # Augmentation (GT가 None인 경우 그대로 통과)
         if self.augment:
-            rgb_cross, rgb_parallel, mask, brown, red, wrinkle = self._apply_augment(
-                rgb_cross, rgb_parallel, mask, brown, red, wrinkle)
+            rgb_cross, rgb_parallel, mask, wrinkle_mask, brown, red, wrinkle = \
+                self._apply_augment(rgb_cross, rgb_parallel, mask, wrinkle_mask, brown, red, wrinkle)
 
         return {
-            'rgb_cross'   : rgb_cross,
-            'rgb_parallel': rgb_parallel,
-            'brown'       : brown,
-            'red'         : red,
-            'wrinkle'     : wrinkle,
-            'mask'        : mask,
-            'has_brown'   : brown   is not None,
-            'has_red'     : red     is not None,
-            'has_wrinkle' : wrinkle is not None,
-            'stem'        : stem,
+            'rgb_cross'    : rgb_cross,
+            'rgb_parallel' : rgb_parallel,
+            'brown'        : brown,
+            'red'          : red,
+            'wrinkle'      : wrinkle,
+            'mask'         : mask,
+            'wrinkle_mask' : wrinkle_mask,
+            'has_brown'    : brown   is not None,
+            'has_red'      : red     is not None,
+            'has_wrinkle'  : wrinkle is not None,
+            'stem'         : stem,
         }
 
 
@@ -250,7 +269,7 @@ def skin_collate_fn(batch: list) -> dict:
     out = {}
 
     # 항상 존재하는 필드
-    for key in ['rgb_cross', 'rgb_parallel', 'mask']:
+    for key in ['rgb_cross', 'rgb_parallel', 'mask', 'wrinkle_mask']:
         out[key] = torch.stack([b[key] for b in batch])
 
     # GT + has_* 플래그 (None은 zeros placeholder로 대체, loss 내부에서 has_*로 마스킹)

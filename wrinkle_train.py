@@ -41,6 +41,15 @@ def _filter_wrinkle_only(dataset: v9.WrinklePositiveSkinDataset) -> None:
     print(f"[wrinkle_only] filtered dataset: kept={len(kept)}, dropped_non_wrinkle={dropped}")
 
 
+class WrinkleDataset(v9.WrinklePositiveSkinDataset):
+    """WrinklePositiveSkinDataset alias for wrinkle-only training.
+
+    Wrinkle-specific mask loading ({subject}_wrinkle_{idx}.png) is handled
+    by the base SkinDataset._load_wrinkle_mask() and returned as
+    batch['wrinkle_mask'] through skin_collate_fn.
+    """
+
+
 class SimpleWrinkleLoss(torch.nn.Module):
     """Simple wrinkle segmentation loss: dice or bce+dice."""
 
@@ -251,7 +260,7 @@ def main() -> None:
 
     model = build_analyzer_v2(base_ch=cfg['base_ch'], low_r=cfg['low_r'], high_r=cfg['high_r']).to(device)
 
-    full_ds = v9.WrinklePositiveSkinDataset(
+    full_ds = WrinkleDataset(
         cfg['patch_dir'],
         cfg['img_size'],
         augment=True,
