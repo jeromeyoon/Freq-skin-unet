@@ -80,6 +80,10 @@ CFG = dict(
     color_temp_range=(0.85, 1.15),
     ambient_fog_alpha_range=(0.0, 0.05),
     ceiling_gradient_prob=0.5,
+    # If True, keep illumination augmentation minimal for OOD light adaptation:
+    # only global intensity + color temperature jitter are used.
+    # Spatial gradient/fog are disabled to avoid over-regularizing morphology.
+    illumination_simple_mode=True,
 
     use_weighted_sampler=True,
     sampler_neg_weight=0.10,
@@ -829,6 +833,13 @@ def train_one_epoch_task_sampled(
         ceiling_gradient_prob=cfg.get('ceiling_gradient_prob', 0.5) * aug_scale,
     )
 
+    # Simple illumination mode:
+    # keep only intensity + color temperature robustness and disable
+    # spatial illumination effects (ceiling gradient / ambient fog).
+    if cfg.get('illumination_simple_mode', False):
+        aug_kwargs['ambient_fog_alpha_range'] = (0.0, 0.0)
+        aug_kwargs['ceiling_gradient_prob'] = 0.0
+
     amp_enabled = device.type == 'cuda'
     consistency_every = max(int(cfg.get('consistency_every_n_steps', 1)), 1)
 
@@ -1072,6 +1083,7 @@ def main():
     print(f"  - wrinkle_focal: gamma={CFG['wrinkle_focal_gamma']}, alpha={CFG['wrinkle_focal_alpha']}")
     print(f"  - wrinkle_gt_dilation: {CFG['wrinkle_gt_dilation']} px")
     print(f"  - wrinkle_solo_epochs: {CFG.get('wrinkle_solo_epochs', 0)}")
+    print(f"  - illumination_simple_mode: {CFG.get('illumination_simple_mode', False)}")
 
     ckpt_dir = Path(CFG['checkpoint_dir'])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
