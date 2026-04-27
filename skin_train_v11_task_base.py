@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import json
 import random
 from pathlib import Path
 
@@ -33,19 +32,6 @@ class TaskSpecificSkinDataset(torch.utils.data.Dataset):
         self.img_size = int(img_size)
         self.augment = bool(augment)
 
-        manifest_path = self.patch_dir / "manifest.json"
-        if not manifest_path.exists():
-            raise FileNotFoundError(f"manifest.json not found: {manifest_path}")
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            self.manifest = json.load(f)
-
-        self.stems = [
-            stem for stem, info in self.manifest.items()
-            if info.get(f"has_{self.task}", False)
-        ]
-        if not self.stems:
-            raise RuntimeError(f"No samples with has_{self.task}=True in {patch_dir}")
-
         self.parallel_dir = "rgb_parallel"
         self.mask_dir = "mask"
         if self.task == "wrinkle":
@@ -59,6 +45,27 @@ class TaskSpecificSkinDataset(torch.utils.data.Dataset):
                 raise FileNotFoundError(
                     f"wrinkle task requires mask_wrinkle folder: {self.patch_dir / self.mask_dir}"
                 )
+
+        # manifest 대신 실제 폴더 스캔으로 stem 구성
+        gt_dir = self.patch_dir / self.task
+        cross_dir = self.patch_dir / "rgb_cross"
+        parallel_dir = self.patch_dir / self.parallel_dir
+        if not gt_dir.exists():
+            raise FileNotFoundError(f"task GT folder not found: {gt_dir}")
+        if not cross_dir.exists():
+            raise FileNotFoundError(f"rgb_cross folder not found: {cross_dir}")
+        if not parallel_dir.exists():
+            raise FileNotFoundError(f"parallel folder not found: {parallel_dir}")
+
+        gt_stems = {p.stem for p in gt_dir.glob("*.png")}
+        cross_stems = {p.stem for p in cross_dir.glob("*.png")}
+        parallel_stems = {p.stem for p in parallel_dir.glob("*.png")}
+
+        self.stems = sorted(gt_stems & cross_stems & parallel_stems)
+        if not self.stems:
+            raise RuntimeError(
+                f"No valid samples found from folder scan: task={self.task}, patch_dir={patch_dir}"
+            )
 
         print(
             f"[TaskSpecificSkinDataset] task={self.task} samples={len(self.stems)} "
