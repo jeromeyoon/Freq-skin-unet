@@ -46,8 +46,12 @@ class TaskSpecificSkinDataset(torch.utils.data.Dataset):
         self.parallel_dir = "rgb_parallel"
         self.mask_dir = "mask"
         if self.task == "wrinkle":
-            if (self.patch_dir / "rgb_parallel_wrinkle").exists():
-                self.parallel_dir = "rgb_parallel_wrinkle"
+            # wrinkle은 rgb_parallel_wrinkle + mask_wrinkle + wrinkle만 사용
+            self.parallel_dir = "rgb_parallel_wrinkle"
+            if not (self.patch_dir / self.parallel_dir).exists():
+                raise FileNotFoundError(
+                    f"wrinkle task requires rgb_parallel_wrinkle folder: {self.patch_dir / self.parallel_dir}"
+                )
             if (self.patch_dir / "mask_wrinkle").exists():
                 self.mask_dir = "mask_wrinkle"
 
