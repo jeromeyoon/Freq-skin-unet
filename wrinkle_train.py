@@ -72,10 +72,20 @@ class SimpleWrinkleLoss(torch.nn.Module):
         if self.mode == 'dice':
             return dice_loss
 
-        # BCE is computed only on valid samples and masked by face region.
-        bce_map = F.binary_cross_entropy_with_logits(logits, gt, reduction='none')
-        bce_map = bce_map * face_mask
-        bce = bce_map[valid].sum() / face_mask[valid].sum().clamp(min=1.0)
+        # Dynamic pos_weight: wrinkle lines are ~1% of face pixels.
+        # Without pos_weight, 99% negative gradient dominates → model collapses to
+        # all-zero predictions → Dice=0.  Boost positive gradient by n_neg/n_pos.
+        valid_4d = valid.view(-1, 1, 1, 1).float()
+        gt_m    = gt * face_mask * valid_4d
+        n_pos   = gt_m.sum().clamp(min=1.0)
+        n_face  = (face_mask * valid_4d).sum().clamp(min=1.0)
+        n_neg   = (n_face - n_pos).clamp(min=1.0)
+        pos_weight = (n_neg / n_pos).clamp(max=50.0)
+
+        bce_map = F.binary_cross_entropy_with_logits(
+            logits, gt, pos_weight=pos_weight, reduction='none')
+        bce_map = bce_map * face_mask * valid_4d
+        bce = bce_map.sum() / (face_mask * valid_4d).sum().clamp(min=1.0)
         return self.bce_weight * bce + (1.0 - self.bce_weight) * dice_loss
 
 

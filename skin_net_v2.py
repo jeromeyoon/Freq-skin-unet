@@ -245,6 +245,10 @@ class SkinAnalyzerV2(nn.Module):
         # mode collapse.  Outside-GT penalty only provides useful gradient when
         # predictions are not already saturated at p≈1.0.
         nn.init.constant_(self.red_head.head[-1].bias, -2.0)
+        # Wrinkle lines are <1% of face pixels — even sparser than red spots.
+        # Start pessimistic so BCE+Dice can bootstrap rather than fighting
+        # an initial 50% prediction that BCE immediately crushes to all-zero.
+        nn.init.constant_(self.wrinkle_head.head[-1].bias, -2.0)
 
     def forward(self,
                 rgb_cross:    torch.Tensor,
