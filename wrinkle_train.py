@@ -12,7 +12,6 @@ Design goal:
 from __future__ import annotations
 
 import argparse
-import copy
 import random
 from pathlib import Path
 
@@ -21,25 +20,90 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
 
 import skin_train_v9 as v9
-from skin_dataset import skin_collate_fn
 from skin_net_v2 import build_analyzer_v2
 
 
-def _filter_wrinkle_only(dataset: v9.WrinklePositiveSkinDataset) -> None:
-    """Keep only stems with wrinkle GT enabled after wrinkle_pos gate."""
-    kept = []
-    dropped = 0
-    for stem in dataset.stems:
-        if dataset.manifest[stem].get('has_wrinkle', False):
-            kept.append(stem)
-        else:
-            dropped += 1
-    dataset.stems = kept
-    print(f"[wrinkle_only] filtered dataset: kept={len(kept)}, dropped_non_wrinkle={dropped}")
+class WrinkleFolderDataset(Dataset):
+    """
+    Folder-based wrinkle patch dataset (no manifest).
+
+    Expected structure:
+      path_root/
+        rgb_parallel/
+        mask_wrinkle/
+        wrinkle/
+    """
+
+    IMG_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
+
+    def __init__(self, path_root: str, img_size: int = 256):
+        self.root = Path(path_root)
+        self.img_size = int(img_size)
+        self.dir_parallel = self.root / 'rgb_parallel'
+        self.dir_mask = self.root / 'mask_wrinkle'
+        self.dir_wrinkle = self.root / 'wrinkle'
+
+        missing = [str(p) for p in (self.dir_parallel, self.dir_mask, self.dir_wrinkle) if not p.exists()]
+        if missing:
+            raise FileNotFoundError(f'missing required folders: {missing}')
+
+        parallel = self._index_dir(self.dir_parallel)
+        mask = self._index_dir(self.dir_mask)
+        wrinkle = self._index_dir(self.dir_wrinkle)
+
+        stems = sorted(set(parallel.keys()) & set(mask.keys()) & set(wrinkle.keys()))
+        if not stems:
+            raise RuntimeError(
+                'No matched files found across rgb_parallel/mask_wrinkle/wrinkle.'
+            )
+
+        self.samples = [(parallel[s], mask[s], wrinkle[s]) for s in stems]
+        print(f"[WrinkleFolderDataset] matched samples: {len(self.samples)}")
+
+    def _index_dir(self, d: Path) -> dict[str, Path]:
+        out = {}
+        for p in d.iterdir():
+            if p.is_file() and p.suffix.lower() in self.IMG_EXTS:
+                out[p.stem] = p
+        return out
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _load_rgb(self, p: Path) -> torch.Tensor:
+        img = Image.open(p).convert('RGB').resize((self.img_size, self.img_size), Image.BILINEAR)
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+        return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+
+    def _load_mask(self, p: Path) -> torch.Tensor:
+        img = Image.open(p).convert('L').resize((self.img_size, self.img_size), Image.NEAREST)
+        arr = (np.asarray(img, dtype=np.float32) > 127).astype(np.float32)
+        return torch.from_numpy(arr).unsqueeze(0).contiguous()
+
+    def __getitem__(self, idx):
+        p_parallel, p_mask, p_wrinkle = self.samples[idx]
+        rgb_parallel = self._load_rgb(p_parallel)
+        mask = self._load_mask(p_mask)
+        wrinkle = self._load_mask(p_wrinkle)
+        return {
+            'rgb_parallel': rgb_parallel,
+            'mask': mask,
+            'wrinkle': wrinkle,
+            'has_wrinkle': True,
+        }
+
+
+def wrinkle_collate_fn(batch):
+    return {
+        'rgb_parallel': torch.stack([b['rgb_parallel'] for b in batch], dim=0),
+        'mask': torch.stack([b['mask'] for b in batch], dim=0),
+        'wrinkle': torch.stack([b['wrinkle'] for b in batch], dim=0),
+        'has_wrinkle': [bool(b['has_wrinkle']) for b in batch],
+    }
 
 
 class SimpleWrinkleLoss(torch.nn.Module):
@@ -132,7 +196,6 @@ def train_one_epoch_wrinkle(model, loader, criterion, optimizer, scaler, device,
 
     pbar = tqdm(loader, desc=f"Train {epoch:03d}/{total_epochs}", unit='batch', leave=False)
     for batch in pbar:
-        rgb_cross = batch['rgb_cross'].to(device, non_blocking=True)
         rgb_parallel = batch['rgb_parallel'].to(device, non_blocking=True)
         wrinkle_gt = batch['wrinkle'].to(device, non_blocking=True)
         face_mask = batch['mask'].to(device, non_blocking=True)
@@ -142,8 +205,10 @@ def train_one_epoch_wrinkle(model, loader, criterion, optimizer, scaler, device,
             skipped += 1
             continue
 
+        # For wrinkle-only folder data, rgb_cross is not provided.
+        # Reuse rgb_parallel as paired input to keep model interface unchanged.
         rgb_cross_aug, rgb_parallel_aug = v9.apply_paired_batch_illumination_aug_fast(
-            rgb_cross, rgb_parallel, **aug_kwargs
+            rgb_parallel, rgb_parallel, **aug_kwargs
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -179,7 +244,6 @@ def validate_wrinkle(model, loader, criterion, device):
     dice_count = 0
 
     for batch in loader:
-        rgb_cross = batch['rgb_cross'].to(device, non_blocking=True)
         rgb_parallel = batch['rgb_parallel'].to(device, non_blocking=True)
         wrinkle_gt = batch['wrinkle'].to(device, non_blocking=True)
         face_mask = batch['mask'].to(device, non_blocking=True)
@@ -188,7 +252,7 @@ def validate_wrinkle(model, loader, criterion, device):
         if not any(has_wrinkle):
             continue
 
-        result = model(rgb_cross, rgb_parallel, face_mask)
+        result = model(rgb_parallel, rgb_parallel, face_mask)
         loss = criterion(result.wrinkle_mask.float(), wrinkle_gt.float(), face_mask.float(), has_wrinkle)
         total_loss += float(loss.item())
         processed += 1
@@ -207,7 +271,7 @@ def validate_wrinkle(model, loader, criterion, device):
 def save_validation_previews(model, loader, device, out_dir: Path, max_items: int = 10):
     """
     Save validation preview images:
-      input(rgb_cross), gt(wrinkle), face_mask, pred(wrinkle prob)
+      input(rgb_parallel), gt(wrinkle), face_mask, pred(wrinkle prob)
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -220,20 +284,19 @@ def save_validation_previews(model, loader, device, out_dir: Path, max_items: in
         if saved >= max_items:
             break
 
-        rgb_cross = batch['rgb_cross'].to(device, non_blocking=True)
         rgb_parallel = batch['rgb_parallel'].to(device, non_blocking=True)
         wrinkle_gt = batch['wrinkle'].to(device, non_blocking=True)
         face_mask = batch['mask'].to(device, non_blocking=True)
 
-        result = model(rgb_cross, rgb_parallel, face_mask)
+        result = model(rgb_parallel, rgb_parallel, face_mask)
         pred_prob = torch.sigmoid(result.wrinkle_mask)
 
-        bsz = rgb_cross.shape[0]
+        bsz = rgb_parallel.shape[0]
         for i in range(bsz):
             if saved >= max_items:
                 break
 
-            inp = (rgb_cross[i].permute(1, 2, 0).clamp(0.0, 1.0).cpu().numpy() * 255.0).astype(np.uint8)
+            inp = (rgb_parallel[i].permute(1, 2, 0).clamp(0.0, 1.0).cpu().numpy() * 255.0).astype(np.uint8)
             gt = _gray_to_rgb_uint8(wrinkle_gt[i, 0])
             msk = _gray_to_rgb_uint8(face_mask[i, 0])
             prd = _gray_to_rgb_uint8(pred_prob[i, 0])
@@ -246,11 +309,10 @@ def save_validation_previews(model, loader, device, out_dir: Path, max_items: in
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Wrinkle-only training (simple loss)')
-    parser.add_argument('--patch_dir', type=str, default=v9.CFG['patch_dir'])
+    parser = argparse.ArgumentParser(description='Wrinkle-only training (folder-based wrinkle_data)')
+    parser.add_argument('--path_root', type=str, default='./wrinkle_data')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints_wrinkle')
     parser.add_argument('--resume', type=str, default=None)
-    parser.add_argument('--wrinkle_min_pos_ratio', type=float, default=v9.CFG['wrinkle_min_pos_ratio'])
     parser.add_argument('--epochs', type=int, default=v9.CFG['epochs'])
     parser.add_argument('--batch_size', type=int, default=v9.CFG['batch_size'])
     parser.add_argument('--loss_mode', type=str, choices=['dice', 'bce_dice'], default='bce_dice')
@@ -258,13 +320,11 @@ def main() -> None:
     parser.add_argument('--val_preview_count', type=int, default=10)
     args = parser.parse_args()
 
-    cfg = copy.deepcopy(v9.CFG)
+    cfg = dict(v9.CFG)
     cfg.update(
-        patch_dir=args.patch_dir,
         checkpoint_dir=args.checkpoint_dir,
         epochs=args.epochs,
         batch_size=args.batch_size,
-        wrinkle_min_pos_ratio=args.wrinkle_min_pos_ratio,
         illumination_simple_mode=True,
     )
 
@@ -285,14 +345,7 @@ def main() -> None:
 
     model = build_analyzer_v2(base_ch=cfg['base_ch'], low_r=cfg['low_r'], high_r=cfg['high_r']).to(device)
 
-    full_ds = v9.WrinklePositiveSkinDataset(
-        cfg['patch_dir'],
-        cfg['img_size'],
-        augment=True,
-        wrinkle_min_pos_ratio=cfg['wrinkle_min_pos_ratio'],
-        compute_missing_pos_ratio=cfg.get('wrinkle_compute_missing_pos_ratio', True),
-    )
-    _filter_wrinkle_only(full_ds)
+    full_ds = WrinkleFolderDataset(args.path_root, cfg['img_size'])
     if len(full_ds) <= 1:
         raise RuntimeError('Need at least 2 wrinkle-positive samples for train/val split.')
 
@@ -314,7 +367,7 @@ def main() -> None:
         num_workers=cfg['num_workers'],
         pin_memory=device.type == 'cuda',
         prefetch_factor=cfg.get('prefetch_factor', 2) if cfg['num_workers'] > 0 else None,
-        collate_fn=skin_collate_fn,
+        collate_fn=wrinkle_collate_fn,
     )
     val_loader = DataLoader(
         val_ds,
@@ -323,7 +376,7 @@ def main() -> None:
         num_workers=cfg['num_workers'],
         pin_memory=device.type == 'cuda',
         prefetch_factor=cfg.get('prefetch_factor', 2) if cfg['num_workers'] > 0 else None,
-        collate_fn=skin_collate_fn,
+        collate_fn=wrinkle_collate_fn,
     )
 
     criterion = SimpleWrinkleLoss(mode=args.loss_mode, bce_weight=args.bce_weight).to(device)
