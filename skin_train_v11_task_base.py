@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import random
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
@@ -34,7 +36,8 @@ class TaskSpecificSkinDataset(torch.utils.data.Dataset):
         manifest_path = self.patch_dir / "manifest.json"
         if not manifest_path.exists():
             raise FileNotFoundError(f"manifest.json not found: {manifest_path}")
-        self.manifest = __import__("json").load(open(manifest_path, "r", encoding="utf-8"))
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            self.manifest = json.load(f)
 
         self.stems = [
             stem for stem, info in self.manifest.items()
@@ -46,7 +49,6 @@ class TaskSpecificSkinDataset(torch.utils.data.Dataset):
         self.parallel_dir = "rgb_parallel"
         self.mask_dir = "mask"
         if self.task == "wrinkle":
-            # wrinkle은 rgb_parallel_wrinkle + mask_wrinkle + wrinkle만 사용
             self.parallel_dir = "rgb_parallel_wrinkle"
             self.mask_dir = "mask_wrinkle"
             if not (self.patch_dir / self.parallel_dir).exists():
@@ -117,7 +119,61 @@ class TaskSpecificSkinDataset(torch.utils.data.Dataset):
         }
 
 
-def train_one_epoch_single_task(model, loader, criterion, optimizer, scaler, device, cfg, epoch, total_epochs, task):
+def _task_tensors(task: str, result, batch: dict, device: torch.device):
+    if task == "brown":
+        return result.brown_mask.float(), batch["brown"].to(device, non_blocking=True).float(), batch["has_brown"]
+    if task == "red":
+        return result.red_mask.float(), batch["red"].to(device, non_blocking=True).float(), batch["has_red"]
+    return result.wrinkle_mask.float(), batch["wrinkle"].to(device, non_blocking=True).float(), batch["has_wrinkle"]
+
+
+def _simple_seg_loss(
+    logits: torch.Tensor,
+    gt: torch.Tensor,
+    face_mask: torch.Tensor,
+    has_gt: list[bool],
+    mode: str,
+    bce_weight: float,
+) -> torch.Tensor:
+    valid = torch.tensor(has_gt, dtype=torch.bool, device=logits.device)
+    if not valid.any():
+        return logits.new_tensor(0.0)
+
+    valid4d = valid.view(-1, 1, 1, 1).float()
+    gt_m = gt * face_mask
+
+    bce_map = F.binary_cross_entropy_with_logits(logits, gt_m, reduction="none")
+    bce = (bce_map * face_mask * valid4d).sum() / (face_mask * valid4d).sum().clamp(min=1.0)
+    if mode == "bce":
+        return bce
+
+    prob = torch.sigmoid(logits) * face_mask
+    prob = prob[valid].flatten(1)
+    gt_f = gt_m[valid].flatten(1)
+    inter = (prob * gt_f).sum(dim=1)
+    denom = prob.sum(dim=1) + gt_f.sum(dim=1)
+    dice_loss = 1.0 - ((2.0 * inter + 1e-6) / (denom + 1e-6)).mean()
+
+    return float(bce_weight) * bce + (1.0 - float(bce_weight)) * dice_loss
+
+
+@torch.no_grad()
+def _dice_metric(logits: torch.Tensor, gt: torch.Tensor, face_mask: torch.Tensor, has_gt: list[bool], threshold=0.5):
+    valid = torch.tensor(has_gt, dtype=torch.bool, device=logits.device)
+    if not valid.any():
+        return 0.0, 0
+
+    pred = (torch.sigmoid(logits) >= threshold).float() * face_mask
+    gt = (gt >= 0.5).float() * face_mask
+    pred = pred[valid].flatten(1)
+    gt = gt[valid].flatten(1)
+    inter = (pred * gt).sum(dim=1)
+    denom = pred.sum(dim=1) + gt.sum(dim=1)
+    dice = (2.0 * inter + 1e-6) / (denom + 1e-6)
+    return float(dice.sum().item()), int(valid.sum().item())
+
+
+def train_one_epoch_single_task(model, loader, optimizer, scaler, device, cfg, epoch, total_epochs, task, loss_mode, bce_weight):
     model.train()
     total_loss = 0.0
     processed_steps = 0
@@ -134,10 +190,7 @@ def train_one_epoch_single_task(model, loader, criterion, optimizer, scaler, dev
     for batch in pbar:
         rgb_cross = batch["rgb_cross"].to(device, non_blocking=True)
         rgb_parallel = batch["rgb_parallel"].to(device, non_blocking=True)
-        brown_gt = batch["brown"].to(device, non_blocking=True)
-        red_gt = batch["red"].to(device, non_blocking=True)
-        wrinkle_gt = batch["wrinkle"].to(device, non_blocking=True)
-        mask = batch["mask"].to(device, non_blocking=True)
+        mask = batch["mask"].to(device, non_blocking=True).float()
 
         rgb_cross_aug, rgb_parallel_aug = v11.apply_paired_batch_illumination_aug_fast(
             rgb_cross, rgb_parallel, **aug_kwargs
@@ -147,21 +200,8 @@ def train_one_epoch_single_task(model, loader, criterion, optimizer, scaler, dev
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             result = model(rgb_cross_aug, rgb_parallel_aug, mask)
 
-        result_for_loss = v11._skin_result_to_fp32(result)
-        loss, _ = criterion(
-            result_for_loss,
-            brown_gt.float(),
-            red_gt.float(),
-            wrinkle_gt.float(),
-            rgb_cross=rgb_cross.float(),
-            face_mask=mask.float(),
-            has_brown=batch["has_brown"],
-            has_red=batch["has_red"],
-            has_wrinkle=batch["has_wrinkle"],
-            model=None,
-            active_task=task,
-        )
-
+        logits, gt, has_gt = _task_tensors(task, result, batch, device)
+        loss = _simple_seg_loss(logits, gt, mask, has_gt, mode=loss_mode, bce_weight=bce_weight)
         if not loss.requires_grad:
             continue
 
@@ -179,7 +219,7 @@ def train_one_epoch_single_task(model, loader, criterion, optimizer, scaler, dev
 
 
 @torch.inference_mode()
-def validate_single_task(model, loader, criterion, device, task, threshold=0.5):
+def validate_single_task(model, loader, device, task, loss_mode, bce_weight, threshold=0.5):
     model.eval()
     total_loss = 0.0
     steps = 0
@@ -190,38 +230,17 @@ def validate_single_task(model, loader, criterion, device, task, threshold=0.5):
     for batch in loader:
         rgb_cross = batch["rgb_cross"].to(device, non_blocking=True)
         rgb_parallel = batch["rgb_parallel"].to(device, non_blocking=True)
-        brown_gt = batch["brown"].to(device, non_blocking=True)
-        red_gt = batch["red"].to(device, non_blocking=True)
-        wrinkle_gt = batch["wrinkle"].to(device, non_blocking=True)
-        mask = batch["mask"].to(device, non_blocking=True)
+        mask = batch["mask"].to(device, non_blocking=True).float()
 
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             result = model(rgb_cross, rgb_parallel, mask)
 
-        result_for_loss = v11._skin_result_to_fp32(result)
-        loss, _ = criterion(
-            result_for_loss,
-            brown_gt.float(),
-            red_gt.float(),
-            wrinkle_gt.float(),
-            rgb_cross=rgb_cross.float(),
-            face_mask=mask.float(),
-            has_brown=batch["has_brown"],
-            has_red=batch["has_red"],
-            has_wrinkle=batch["has_wrinkle"],
-            model=None,
-            active_task=task,
-        )
+        logits, gt, has_gt = _task_tensors(task, result, batch, device)
+        loss = _simple_seg_loss(logits, gt, mask, has_gt, mode=loss_mode, bce_weight=bce_weight)
         total_loss += float(loss.item())
         steps += 1
 
-        if task == "brown":
-            dsum, dcnt = v11._dice_sum_and_count(result_for_loss.brown_mask, brown_gt.float(), mask.float(), batch["has_brown"], threshold=threshold)
-        elif task == "red":
-            dsum, dcnt = v11._dice_sum_and_count(result_for_loss.red_mask, red_gt.float(), mask.float(), batch["has_red"], threshold=threshold)
-        else:
-            dsum, dcnt = v11._dice_sum_and_count(result_for_loss.wrinkle_mask, wrinkle_gt.float(), mask.float(), batch["has_wrinkle"], threshold=threshold)
-
+        dsum, dcnt = _dice_metric(logits, gt, mask, has_gt, threshold=threshold)
         dice_sum += dsum
         dice_cnt += dcnt
 
@@ -238,6 +257,8 @@ def run_single_task(task: str) -> None:
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=v11.CFG["epochs"])
     parser.add_argument("--batch_size", type=int, default=v11.CFG["batch_size"])
+    parser.add_argument("--loss_mode", type=str, choices=["bce", "dice_bce"], default="dice_bce")
+    parser.add_argument("--bce_weight", type=float, default=0.5)
     args = parser.parse_args()
 
     cfg = copy.deepcopy(v11.CFG)
@@ -257,7 +278,10 @@ def run_single_task(task: str) -> None:
         torch.backends.cudnn.benchmark = True
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device} | task={task} | patch_dir={cfg['patch_dir']}")
+    print(
+        f"Device: {device} | task={task} | patch_dir={cfg['patch_dir']} | "
+        f"loss_mode={args.loss_mode} | bce_weight={args.bce_weight:.2f}"
+    )
 
     ckpt_dir = Path(cfg["checkpoint_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -303,20 +327,6 @@ def run_single_task(task: str) -> None:
         collate_fn=skin_collate_fn,
     )
 
-    criterion = v11.TaskAwareSkinAnalyzerLossV9(
-        w_brown=1.0 if task == "brown" else 0.0,
-        w_red=1.0 if task == "red" else 0.0,
-        w_wrinkle=1.0 if task == "wrinkle" else 0.0,
-        w_recon=0.0,
-        red_gt_dilation=cfg.get("red_gt_dilation", 0),
-        wrinkle_focal_gamma=cfg["wrinkle_focal_gamma"],
-        wrinkle_focal_alpha=cfg["wrinkle_focal_alpha"],
-        wrinkle_edge_weight=cfg["wrinkle_edge_weight"],
-        wrinkle_gt_dilation=cfg["wrinkle_gt_dilation"],
-    ).to(device)
-    criterion.w_consist = 0.0
-    criterion.w_freq_reg = 0.0
-
     optimizer = optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg["epochs"])
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
@@ -339,10 +349,26 @@ def run_single_task(task: str) -> None:
     print(f"Start {task}-only training...")
     for epoch in range(start_epoch, cfg["epochs"] + 1):
         train_log = train_one_epoch_single_task(
-            model, train_loader, criterion, optimizer, scaler, device, cfg, epoch, cfg["epochs"], task
+            model,
+            train_loader,
+            optimizer,
+            scaler,
+            device,
+            cfg,
+            epoch,
+            cfg["epochs"],
+            task,
+            args.loss_mode,
+            args.bce_weight,
         )
         val_log = validate_single_task(
-            model, val_loader, criterion, device, task, threshold=cfg.get("dice_threshold", 0.5)
+            model,
+            val_loader,
+            device,
+            task,
+            args.loss_mode,
+            args.bce_weight,
+            threshold=cfg.get("dice_threshold", 0.5),
         )
         scheduler.step()
 
@@ -359,6 +385,8 @@ def run_single_task(task: str) -> None:
             "scaler_state_dict": scaler.state_dict(),
             "best_dice": best_dice,
             "task": task,
+            "loss_mode": args.loss_mode,
+            "bce_weight": args.bce_weight,
             "train_loss": train_log,
             "val_loss": val_log,
             "cfg": cfg,
