@@ -91,6 +91,10 @@ def parse_args() -> argparse.Namespace:
                         help='number of patches per inference batch')
     parser.add_argument('--mask_threshold', type=float, default=0.5,
                         help='threshold for saving binary masks')
+    parser.add_argument('--wrinkle_threshold', type=float, default=0.4,
+                        help='lower threshold for wrinkle (use with --wrinkle_thin)')
+    parser.add_argument('--wrinkle_thin', action='store_true',
+                        help='apply morphological thinning to wrinkle mask for line output')
 
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='device to use')
@@ -277,7 +281,20 @@ def main() -> None:
             TF.to_pil_image(skin_save).save(mask_dir / 'skin' / f'{stem}.png')
             TF.to_pil_image((brown_prob >= args.mask_threshold).float()).save(mask_dir / 'brown' / f'{stem}.png')
             TF.to_pil_image((red_prob >= args.mask_threshold).float()).save(mask_dir / 'red' / f'{stem}.png')
-            TF.to_pil_image((wrinkle_prob >= args.mask_threshold).float()).save(mask_dir / 'wrinkle' / f'{stem}.png')
+            # Wrinkle: optionally thin the binary mask to line representation.
+            # Lower threshold captures more wrinkles before thinning discards width.
+            wrinkle_thr = args.wrinkle_threshold if args.wrinkle_thin else args.mask_threshold
+            wrinkle_bin = (wrinkle_prob >= wrinkle_thr).float()
+            if args.wrinkle_thin:
+                try:
+                    import cv2
+                    import numpy as np
+                    arr = (wrinkle_bin.squeeze().numpy() * 255).astype(np.uint8)
+                    thinned = cv2.ximgproc.thinning(arr)
+                    wrinkle_bin = torch.from_numpy(thinned / 255.0).unsqueeze(0).float()
+                except Exception:
+                    pass  # fallback: save without thinning if opencv-contrib unavailable
+            TF.to_pil_image(wrinkle_bin).save(mask_dir / 'wrinkle' / f'{stem}.png')
 
         rgb_parallel_full = load_rgb_full(parallel_path)
         diag = extract_illumination_diagnostics(

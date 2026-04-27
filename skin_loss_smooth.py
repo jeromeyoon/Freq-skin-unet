@@ -295,4 +295,18 @@ def get_loss_weights(epoch:        int,
     else:
         aux = {**base_aux, 'w_consist': 0.3, 'w_freq_reg': 0.1}
 
+    # Consistency override: start from epoch 1 at low weight so the model
+    # cannot build illumination-dependent features in early training.
+    # The standard schedule above would set w_consist=0 for the first 40%,
+    # but by then illumination-correlated weights are already baked in.
+    # This early ramp is additive to whatever the phase schedule produced.
+    if progress < 0.10:
+        # Epochs 0~10% (wrinkle solo overlap): minimal but non-zero consistency
+        aux = {**aux, 'w_consist': max(aux.get('w_consist', 0.0), 0.05)}
+    elif progress < 0.20:
+        # Epochs 10~20%: ramp 0.05→0.20
+        t = (progress - 0.10) / 0.10
+        early_w = _lerp(0.05, 0.20, t)
+        aux = {**aux, 'w_consist': max(aux.get('w_consist', 0.0), early_w)}
+
     return {**task, **aux}

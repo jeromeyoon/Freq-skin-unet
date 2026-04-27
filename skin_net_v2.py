@@ -241,6 +241,11 @@ class SkinAnalyzerV2(nn.Module):
         self.red_head     = SpotHeadV2(base_ch)
         self.wrinkle_head = WrinkleHead(base_ch)
 
+        # Red head: start with logit=-2 (p≈0.12) to prevent "predict everywhere"
+        # mode collapse.  Outside-GT penalty only provides useful gradient when
+        # predictions are not already saturated at p≈1.0.
+        nn.init.constant_(self.red_head.head[-1].bias, -2.0)
+
     def forward(self,
                 rgb_cross:    torch.Tensor,
                 rgb_parallel: torch.Tensor,

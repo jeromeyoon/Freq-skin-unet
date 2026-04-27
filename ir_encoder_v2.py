@@ -182,10 +182,17 @@ class CrossPolEncoderV2(nn.Module):
         # 1. OD 계산 (수치 안정화)
         od = -torch.log(rgb.clamp(min=self.eps, max=1.0)).clamp(-6.0, 6.0)
 
-        # 2. OD 공간에서 조명 제거 (Beer-Lambert additive 성질 활용)
+        # 2. Gray-world 색온도 정규화 (색온도 불변 OD)
+        # 곱셈 조명 변화(warm/cool light)는 OD_R, OD_G, OD_B를 동일하게 이동시킴.
+        # 채널별 공간 평균을 빼면 이 이동이 제거되고 발색단 비율 정보만 남음.
+        # 예: warm light → OD_R 감소, OD_G 감소 → 평균 제거 후 상대 비율 보존.
+        od_mean = od.flatten(2).mean(dim=2).unsqueeze(-1).unsqueeze(-1)  # [B,3,1,1]
+        od = od - od_mean
+
+        # 3. OD 공간에서 조명 제거 (Beer-Lambert additive 성질 활용)
         od_chroma = self.od_filter(od)                # [B, 3, H, W]
 
-        # 3. 색차 채널 추가 후 프로젝션
+        # 4. 색차 채널 추가 후 프로젝션
         rg = od_chroma[:, 0:1] - od_chroma[:, 1:2]   # R-G 색차
         gb = od_chroma[:, 1:2] - od_chroma[:, 2:3]   # G-B 색차
         x5 = torch.cat([od_chroma, rg, gb], dim=1)   # [B, 5, H, W]

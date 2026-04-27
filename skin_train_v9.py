@@ -59,7 +59,7 @@ CFG = dict(
     high_r=0.4,
     img_size=256,
 
-    epochs=50,
+    epochs=80,
     batch_size=16,
     lr=1e-4,
     weight_decay=1e-4,
@@ -76,9 +76,9 @@ CFG = dict(
     best_w_wrinkle=1.2,
 
     aug_warmup_epochs=15,
-    intensity_range=(0.85, 1.15),
-    color_temp_range=(0.85, 1.15),
-    ambient_fog_alpha_range=(0.0, 0.05),
+    intensity_range=(0.6, 1.4),
+    color_temp_range=(0.5, 1.5),
+    ambient_fog_alpha_range=(0.0, 0.10),
     ceiling_gradient_prob=0.5,
 
     use_weighted_sampler=True,
@@ -86,8 +86,8 @@ CFG = dict(
     prefetch_factor=4,
     consistency_every_n_steps=2,
 
-    red_area_weight=0.10,
-    red_outside_weight=0.05,
+    red_area_weight=0.40,
+    red_outside_weight=0.70,
 
     # ── Wrinkle loss (Tversky + Focal + Edge) ─────────────────────────────
     # Tversky: alpha=FP weight, beta=FN weight.
@@ -103,9 +103,9 @@ CFG = dict(
     # Sobel edge agreement: encourages precise wrinkle boundary placement.
     wrinkle_edge_weight=0.15,
     # GT soft-label dilation (pixels).  VISIA wrinkle GT is often annotated
-    # as a thin center line; dilating by 1–2 px makes supervision forgiving
-    # without losing spatial precision.
-    wrinkle_gt_dilation=2,
+    # as a thin center line; dilating by 1 px is sufficient — 2 px produces
+    # 5 px wide supervision bands that encourage blob predictions.
+    wrinkle_gt_dilation=1,
 
     # Minimum wrinkle-positive pixel ratio to count a patch as supervised.
     # 5e-4 ≈ 33 pixels in a 256×256 patch — avoids training on near-empty GT.
@@ -123,11 +123,15 @@ CFG = dict(
     ),
     # Train wrinkle-only for the first N epochs so wrinkle signal is not
     # dominated by the stronger brown/red gradient in early training.
-    # Extended 5→15: ParallelPolEncoder high-freq gate starts at sigmoid(-2)≈0.12
-    # and needs more epochs to open before brown/red gradients compete.
-    wrinkle_solo_epochs=8,
+    # ParallelPolEncoder high-freq gate starts at sigmoid(-2)≈0.12 and needs
+    # extended solo time before brown/red gradients compete.  20 epochs gives
+    # the gate enough gradient steps to open to a useful range (~0.5).
+    wrinkle_solo_epochs=20,
     # Curriculum Tversky ramp length (epochs). Set to ~30% of total epochs.
-    wrinkle_tversky_ramp_epochs=15,
+    wrinkle_tversky_ramp_epochs=24,
+    # CLDice weight in wrinkle loss: enforces line topology (no blob prediction).
+    wrinkle_cldice_weight=0.35,
+    wrinkle_cldice_iter=5,
 
     seed=42,
     preview_interval=10,
@@ -287,6 +291,76 @@ def _skin_result_to_fp32(result):
     )
 
 
+# ── CLDice helpers ────────────────────────────────────────────────────────────
+# Connectivity-preserving loss for thin structures (wrinkle lines).
+# Reference: Shit et al., "clDice — a Novel Topology-Preserving Loss Function
+# for Tubular Structure Segmentation", CVPR 2021.
+
+def _soft_erode(x: torch.Tensor) -> torch.Tensor:
+    """Min-pool along H and W separately (structuring element: cross)."""
+    p1 = -F.max_pool2d(-x, (3, 1), stride=(1, 1), padding=(1, 0))
+    p2 = -F.max_pool2d(-x, (1, 3), stride=(1, 1), padding=(0, 1))
+    return torch.min(p1, p2)
+
+
+def _soft_dilate(x: torch.Tensor) -> torch.Tensor:
+    return F.max_pool2d(x, (3, 3), stride=(1, 1), padding=(1, 1))
+
+
+def _soft_open(x: torch.Tensor) -> torch.Tensor:
+    return _soft_dilate(_soft_erode(x))
+
+
+def _soft_skel(x: torch.Tensor, num_iter: int = 5) -> torch.Tensor:
+    """Differentiable soft skeleton via iterative morphological thinning."""
+    skel = F.relu(x - _soft_open(x))
+    x = _soft_erode(x)
+    for _ in range(num_iter - 1):
+        delta = F.relu(x - _soft_open(x))
+        skel = skel + F.relu(delta - skel * delta)
+        x = _soft_erode(x)
+    return skel
+
+
+def _cl_dice_loss(
+    pred_logit: torch.Tensor,
+    gt: torch.Tensor,
+    face_mask: torch.Tensor,
+    has_gt: list,
+    num_iter: int = 5,
+) -> torch.Tensor:
+    """
+    CLDice: connectivity-preserving dice for line-like wrinkle structures.
+
+    Two complementary terms:
+      topo1: skeleton(pred) ∩ GT — ensures predicted lines hit real wrinkles
+      topo2: pred ∩ skeleton(GT) — prevents thick blob predictions
+    """
+    avail = torch.tensor(has_gt, dtype=torch.float32, device=pred_logit.device)
+    if avail.sum() <= 0:
+        return pred_logit.new_tensor(0.0)
+
+    prob = torch.sigmoid(pred_logit) * face_mask
+    gt_m = gt * face_mask
+
+    skel_pred = _soft_skel(prob, num_iter)
+    skel_gt   = _soft_skel(gt_m, num_iter)
+
+    # topo1: skeleton of prediction must overlap GT
+    t1_num = (skel_pred * gt_m).flatten(1).sum(1)
+    t1_den = skel_pred.flatten(1).sum(1) + gt_m.flatten(1).sum(1)
+    topo1 = 1.0 - (2.0 * t1_num + 1e-6) / (t1_den + 1e-6)
+
+    # topo2: prediction must overlap skeleton of GT (penalises blobs)
+    t2_num = (prob * skel_gt).flatten(1).sum(1)
+    t2_den = prob.flatten(1).sum(1) + skel_gt.flatten(1).sum(1)
+    topo2 = 1.0 - (2.0 * t2_num + 1e-6) / (t2_den + 1e-6)
+
+    cl_dice = 0.5 * topo1 + 0.5 * topo2
+    n_valid = avail.sum().clamp(min=1.0)
+    return (cl_dice * avail).sum() / n_valid
+
+
 def _v2_freq_reg(model: torch.nn.Module) -> torch.Tensor:
     """
     ODFrequencyFilter.low_logit regularization for SkinAnalyzerV2.
@@ -404,14 +478,16 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         *args,
         red_focal_alpha: float = 0.75,
         red_gt_dilation: int = 0,
-        red_area_weight: float = 0.20,
-        red_outside_weight: float = 0.12,
+        red_area_weight: float = 0.40,
+        red_outside_weight: float = 0.70,
         wrinkle_tversky_alpha: float = 0.3,
         wrinkle_tversky_beta: float = 0.7,
         wrinkle_focal_gamma: float = 3.0,
         wrinkle_focal_alpha: float = 0.97,
         wrinkle_edge_weight: float = 0.15,
-        wrinkle_gt_dilation: int = 2,
+        wrinkle_gt_dilation: int = 1,
+        wrinkle_cldice_weight: float = 0.35,
+        wrinkle_cldice_iter: int = 5,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -425,6 +501,8 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         self.wrinkle_focal_alpha = wrinkle_focal_alpha
         self.wrinkle_edge_weight = wrinkle_edge_weight
         self.wrinkle_gt_dilation = wrinkle_gt_dilation
+        self.wrinkle_cldice_weight = wrinkle_cldice_weight
+        self.wrinkle_cldice_iter = wrinkle_cldice_iter
 
         # Pre-built edge kernels (registered as buffers so device moves work).
         self.register_buffer(
@@ -683,14 +761,18 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
         l_wrinkle_focal = self._wrinkle_focal_bce(
             result.wrinkle_mask, wrinkle_gt_soft, face_mask, has_wrinkle
         )
-        # Edge loss uses raw (un-dilated) GT so boundaries remain crisp.
-        l_wrinkle_edge = self._wrinkle_edge_loss(
-            result.wrinkle_mask, wrinkle_gt, face_mask, has_wrinkle
+        # CLDice: topology-preserving loss that penalises blob predictions.
+        # Uses soft GT so the skeleton computation has a continuous input.
+        l_wrinkle_cldice = _cl_dice_loss(
+            result.wrinkle_mask, wrinkle_gt_soft, face_mask, has_wrinkle,
+            num_iter=self.wrinkle_cldice_iter,
         )
+        # Weights: Tversky(recall) + CLDice(topology) dominate; Focal handles
+        # pixel-level class imbalance at lower weight.
         l_wrinkle = (
-            l_wrinkle_tversky
-            + l_wrinkle_focal
-            + self.wrinkle_edge_weight * l_wrinkle_edge
+            0.50 * l_wrinkle_tversky
+            + self.wrinkle_cldice_weight * l_wrinkle_cldice
+            + 0.15 * l_wrinkle_focal
         )
 
         detail.update(
@@ -702,7 +784,7 @@ class TaskAwareSkinAnalyzerLossV9(SkinAnalyzerLoss):
             red_outside=l_red_outside.item(),
             wrinkle_tversky=l_wrinkle_tversky.item(),
             wrinkle_focal=l_wrinkle_focal.item(),
-            wrinkle_edge=l_wrinkle_edge.item(),
+            wrinkle_cldice=l_wrinkle_cldice.item(),
         )
 
         loss = torch.tensor(0.0, device=rgb_cross.device)
@@ -1155,6 +1237,8 @@ def main():
         wrinkle_focal_alpha=CFG['wrinkle_focal_alpha'],
         wrinkle_edge_weight=CFG['wrinkle_edge_weight'],
         wrinkle_gt_dilation=CFG['wrinkle_gt_dilation'],
+        wrinkle_cldice_weight=CFG.get('wrinkle_cldice_weight', 0.35),
+        wrinkle_cldice_iter=CFG.get('wrinkle_cldice_iter', 5),
     ).to(device)
 
     optimizer = optim.AdamW(
