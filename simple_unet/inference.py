@@ -54,19 +54,19 @@ def patch_infer(model: torch.nn.Module,
                 batch_size: int,
                 device: torch.device) -> torch.Tensor:
     """
-    img_t     : [3, H, W] normalized tensor (CPU)
-    returns   : [1, H, W] prediction in [0,1] (CPU)
+    img_t   : [3, H, W] normalized tensor (CPU)
+    returns : [1, H, W] prediction in [0,1] (CPU)
 
     동작:
-      1. 이미지를 패치로 분할 (패딩 후)
-      2. 배치 단위로 모델 추론
-      3. Hann window 가중치로 겹치는 영역 블렌딩
-      4. 원본 해상도로 crop 후 반환
+      1. replicate padding으로 패치가 이미지를 완전히 커버하도록 확장
+      2. 패치 배치 단위 GPU 추론
+      3. Hann window 가중치로 overlap 영역 블렌딩 (GPU 위에서 처리)
+      4. 원본 크기로 crop 후 CPU 반환
     """
     C, H, W = img_t.shape
 
-    # ── 패딩 계산 (stride 단위로 패치가 이미지를 완전히 커버하도록) ──
-    def pad_to_fit(size, ps, st):
+    # ── 패딩량 계산 ──
+    def pad_to_fit(size: int, ps: int, st: int) -> int:
         if size <= ps:
             return ps - size
         remainder = (size - ps) % st
@@ -75,41 +75,41 @@ def patch_infer(model: torch.nn.Module,
     pad_h = pad_to_fit(H, patch_size, stride)
     pad_w = pad_to_fit(W, patch_size, stride)
 
-    # reflect padding으로 경계 아티팩트 최소화
+    # replicate: reflect와 달리 패드 크기가 입력보다 커도 안전
     img_pad = F.pad(img_t.unsqueeze(0),
-                    (0, pad_w, 0, pad_h), mode='reflect').squeeze(0)
+                    (0, pad_w, 0, pad_h), mode='replicate').squeeze(0)  # [3,H_p,W_p]
     _, H_p, W_p = img_pad.shape
 
-    # ── 패치 좌표 생성 ──
+    # ── 패치 좌표 목록 ──
     ys = list(range(0, H_p - patch_size + 1, stride))
     xs = list(range(0, W_p - patch_size + 1, stride))
+    coords = [(y, x) for y in ys for x in xs]
+    patches = [img_pad[:, y:y+patch_size, x:x+patch_size] for y, x in coords]
 
-    patches, coords = [], []
-    for y in ys:
-        for x in xs:
-            patches.append(img_pad[:, y:y+patch_size, x:x+patch_size])
-            coords.append((y, x))
-
-    # ── 배치 추론 ──
-    weight_map = _hann2d(patch_size).to(device)   # [P,P]
-    accum  = torch.zeros(1, H_p, W_p)             # 누적 예측값
-    counts = torch.zeros(1, H_p, W_p)             # 누적 가중치
+    # ── GPU 위에서 누적 (shape/device 불일치 원천 제거) ──
+    weight_map = _hann2d(patch_size).to(device, dtype=torch.float32)  # [P,P]
+    accum  = torch.zeros(1, H_p, W_p, device=device, dtype=torch.float32)
+    counts = torch.zeros(1, H_p, W_p, device=device, dtype=torch.float32)
 
     model.eval()
     with torch.no_grad():
         for start in range(0, len(patches), batch_size):
-            batch_p = torch.stack(patches[start:start+batch_size]).to(device)
-            preds   = model(batch_p)               # [B,1,P,P]
+            batch_p = torch.stack(patches[start:start+batch_size])   # [B,3,P,P] CPU
+            batch_p = batch_p.to(device=device, dtype=torch.float32)
 
-            for j, pred in enumerate(preds):
-                y, x = coords[start + j]
-                w    = weight_map                  # [P,P]
-                accum[0, y:y+patch_size, x:x+patch_size]  += (pred[0] * w).cpu()
-                counts[0, y:y+patch_size, x:x+patch_size] += w.cpu()
+            preds = model(batch_p)   # [B,1,P,P] GPU float32
 
-    # ── 가중 평균 → 원본 크기 crop ──
-    pred_full = accum / counts.clamp(min=1e-6)
-    return pred_full[:, :H, :W]                   # [1, H, W]
+            for j in range(preds.size(0)):
+                y, x  = coords[start + j]
+                pred_patch = preds[j, 0]                              # [P,P] GPU
+                weighted   = pred_patch * weight_map                  # [P,P] GPU
+
+                accum [0, y:y+patch_size, x:x+patch_size].add_(weighted)
+                counts[0, y:y+patch_size, x:x+patch_size].add_(weight_map)
+
+    # ── 가중 평균 → 원본 크기 crop → CPU ──
+    pred_full = (accum / counts.clamp(min=1e-6))[:, :H, :W]         # [1,H,W] GPU
+    return pred_full.cpu()                                            # [1,H,W] CPU
 
 
 # ─────────────────────── metrics ────────────────────────────
