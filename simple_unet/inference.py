@@ -173,19 +173,57 @@ def save_compare(orig: Image.Image,
 
 # ─────────────────────── file helpers ───────────────────────
 
-def collect_images(input_root: Path, gt_root: Path | None) -> list[tuple[Path, Path | None]]:
+def collect_images(input_root: Path,
+                   gt_root: Path | None,
+                   img_filename: str = 'F_11.jpg') -> list[tuple[Path, Path | None, str]]:
+    """
+    input_root/ID/img_filename 구조를 탐색.
+    반환: [(img_path, gt_path or None, ID), ...]
+
+    GT 매칭 순서:
+      1. gt_root/ID.png
+      2. gt_root/ID/{img_filename stem}.png
+      3. gt_root/ID/ 안의 첫 번째 이미지
+    """
     items = []
-    for p in sorted(input_root.iterdir()):
-        if p.suffix.lower() not in IMG_EXTS:
+    for id_dir in sorted(input_root.iterdir()):
+        if not id_dir.is_dir():
             continue
+
+        img_path = id_dir / img_filename
+        if not img_path.exists():
+            # img_filename이 없으면 폴더 안 첫 번째 이미지 사용
+            candidates = [p for p in sorted(id_dir.iterdir())
+                          if p.suffix.lower() in IMG_EXTS]
+            if not candidates:
+                continue
+            img_path = candidates[0]
+
         gt = None
         if gt_root is not None:
-            for ext in ['.png', p.suffix]:
-                c = gt_root / (p.stem + ext)
-                if c.exists():
-                    gt = c
+            stem = img_path.stem
+            id_name = id_dir.name
+            # 우선순위 순으로 GT 경로 탐색
+            for candidate in [
+                gt_root / f"{id_name}.png",
+                gt_root / id_name / f"{stem}.png",
+                gt_root / id_name / f"{id_name}.png",
+            ]:
+                if candidate.exists():
+                    gt = candidate
                     break
-        items.append((p, gt))
+            # 위 세 경로 모두 없으면 gt_root/ID/ 안 첫 번째 이미지
+            if gt is None:
+                gt_id_dir = gt_root / id_name
+                if gt_id_dir.is_dir():
+                    found = [p for p in sorted(gt_id_dir.iterdir())
+                             if p.suffix.lower() in IMG_EXTS]
+                    if found:
+                        gt = found[0]
+
+        items.append((img_path, gt, id_dir.name))   # ID = 서브폴더 이름
+
+    assert items, f"No images found under {input_root} (looking for {img_filename})"
     return items
 
 
@@ -202,8 +240,10 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--checkpoint',   required=True)
     p.add_argument('--input_root',   required=True)
-    p.add_argument('--gt_root',      default=None)
-    p.add_argument('--save_dir',     default='./inference_results')
+    p.add_argument('--gt_root',       default=None)
+    p.add_argument('--img_filename',  default='F_11.jpg',
+                   help='각 ID 폴더 안에서 읽을 이미지 파일명')
+    p.add_argument('--save_dir',      default='./inference_results')
     p.add_argument('--patch_size',   type=int,   default=512,
                    help='패치 크기 (모델 학습 img_size와 동일 권장)')
     p.add_argument('--stride',       type=int,   default=384,
@@ -238,15 +278,14 @@ def main():
 
     criterion = SegLoss()
     gt_root   = Path(args.gt_root) if args.gt_root else None
-    items     = collect_images(Path(args.input_root), gt_root)
-    assert items, f"No images found in {args.input_root}"
+    items     = collect_images(Path(args.input_root), gt_root, args.img_filename)
     print(f"Images      : {len(items)}  |  GT: {'yes' if gt_root else 'no'}\n")
 
     all_dice, all_iou, all_loss = [], [], []
     csv_rows: list[dict] = []
 
-    for img_path, gt_path in tqdm(items, desc='Images'):
-        stem = img_path.stem
+    for img_path, gt_path, id_name in tqdm(items, desc='Images'):
+        stem = id_name          # 출력 파일명 = ID 폴더명
 
         # ── 이미지 로드 ──
         img_t, orig_pil = load_image_tensor(img_path)
